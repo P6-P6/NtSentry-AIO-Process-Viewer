@@ -3,6 +3,7 @@
 //! Each entry's file is resolved from its registered command line and checked
 //! for: a missing file, a temp or user-writable location, its Authenticode
 //! signature, a URL in the command, and script hosts used as the launcher.
+//! The kernel's view of drivers is checked in `driver_audit`.
 
 use crate::findings::{Finding, ScanReport, Severity, sort_findings};
 use crate::inventory::{SystemInventory, image_path_from_command};
@@ -60,8 +61,9 @@ pub fn assess(e: &Entry) -> Vec<Finding> {
     let subject = subject(e.kind, e.name, e.location);
     let noun = e.kind.noun();
     let mut out = Vec::new();
+    let existing = e.file.filter(|(_, exists)| *exists).map(|(f, _)| f.to_string());
     let mut push = |severity, title: String, detail: String| {
-        out.push(Finding::new(MODULE, severity, &subject, title).detail(detail));
+        out.push(Finding { file: existing.clone(), ..Finding::new(MODULE, severity, &subject, title).detail(detail) });
     };
     let command = e.command.to_lowercase();
     if command.contains("http://") || command.contains("https://") {
@@ -119,6 +121,9 @@ pub fn assess(e: &Entry) -> Vec<Finding> {
             let what = if unsigned { "an unsigned file in a user-writable folder" } else { "a file in a user-writable folder" };
             push(severity, format!("{noun} uses {what}"), file.to_string());
         }
+        Some(PathClass::Other) if e.kind == EntryKind::Driver && e.running && !unsigned => {
+            push(Severity::Low, "Running driver loads from outside Windows and Program Files".into(), file.to_string());
+        }
         _ if unsigned => {
             let severity = match (e.kind, e.running, e.class) {
                 (EntryKind::Driver, true, _) => Severity::High,
@@ -171,12 +176,15 @@ pub fn scan(inv: &SystemInventory, cache: &mut SignatureCache, dirs: &KnownDirs)
     for a in &inv.startup {
         evaluate(EntryKind::Startup, &a.name, &a.location, &a.command, false, cache);
     }
+    let drivers = crate::driver_audit::scan(inv, cache, dirs);
+    findings.extend(drivers.findings);
     let summary = format!(
-        "Persistence: {checked} entries ({} services, {} drivers, {} startup), {} finding(s)",
+        "Persistence: {checked} entries ({} services, {} drivers, {} startup), {} finding(s). {}",
         inv.services.len(),
         inv.drivers.len(),
         inv.startup.len(),
-        findings.len()
+        findings.len(),
+        drivers.summary
     );
     for e in &inv.errors {
         findings.push(Finding::new(MODULE, Severity::Low, "inventory", "Part of the inventory could not be read").detail(e.clone()));
@@ -239,6 +247,15 @@ mod tests {
         let mut e = entry(EntryKind::Driver, r"\SystemRoot\x.sys", Some((r"C:\Windows\x.sys", false)), Some(PathClass::Windows), None);
         assert_eq!(severities(&assess(&e)), vec![Severity::High]);
         e.running = false;
+        assert!(assess(&e).is_empty());
+    }
+
+    #[test]
+    fn running_drivers_outside_windows_are_noted() {
+        let valid = sig(SignatureState::Valid);
+        let e = entry(EntryKind::Driver, r"\??\D:\Tools\hw.sys", Some((r"D:\Tools\hw.sys", true)), Some(PathClass::Other), Some(&valid));
+        assert_eq!(severities(&assess(&e)), vec![Severity::Low]);
+        let e = entry(EntryKind::Driver, r"\SystemRoot\System32\drivers\ok.sys", Some((r"C:\Windows\System32\drivers\ok.sys", true)), Some(PathClass::Windows), Some(&valid));
         assert!(assess(&e).is_empty());
     }
 

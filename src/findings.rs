@@ -43,6 +43,9 @@ pub struct Finding {
     /// Observed bytes as space-separated hex (in memory).
     pub observed: Option<String>,
     pub observed_unix: u64,
+    /// The file the finding is about, for "Open file location".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 impl Finding {
@@ -57,7 +60,13 @@ impl Finding {
             expected: None,
             observed: None,
             observed_unix: crate::winutil::now_unix(),
+            file: None,
         }
+    }
+
+    pub fn file(mut self, path: impl Into<String>) -> Self {
+        self.file = Some(path.into());
+        self
     }
 
     pub fn detail(mut self, detail: impl Into<String>) -> Self {

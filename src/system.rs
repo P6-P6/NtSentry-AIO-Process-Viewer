@@ -191,6 +191,96 @@ unsafe fn image_path(handle: HANDLE) -> String {
     }
 }
 
+/// Turns on SeDebugPrivilege when the account holds it (elevated administrators),
+/// as Task Manager and Process Explorer do, so query-only handles open for
+/// service and protected processes. Enables a right the token already has;
+/// grants nothing new. Returns whether it is on.
+pub fn enable_debug_privilege() -> bool {
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let token = OwnedHandle(token);
+        let mut luid: LUID = zeroed();
+        if LookupPrivilegeValueW(null(), SE_DEBUG_NAME, &mut luid) == 0 {
+            return false;
+        }
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+        };
+        // Succeeds with ERROR_NOT_ALL_ASSIGNED when the token lacks the privilege.
+        AdjustTokenPrivileges(token.0, 0, &privileges, 0, null_mut(), null_mut()) != 0 && GetLastError() == ERROR_SUCCESS
+    }
+}
+
+/// Whether this process runs elevated (Run as administrator).
+pub fn is_elevated() -> bool {
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let token = OwnedHandle(token);
+        let mut elevation: TOKEN_ELEVATION = zeroed();
+        let mut returned = 0u32;
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            &mut elevation as *mut TOKEN_ELEVATION as *mut c_void,
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        ) != 0
+            && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Image path of a process by PID without opening it, for processes that refuse
+/// even query-only handles (some protected and anti-cheat guarded ones).
+pub fn image_path_by_pid(pid: u32) -> Option<String> {
+    use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
+    #[repr(C)]
+    struct SystemProcessIdInformation {
+        process_id: HANDLE,
+        image_name: UNICODE_STRING,
+    }
+    const SYSTEM_PROCESS_ID_INFORMATION: i32 = 88;
+    if pid == 0 || pid == 4 {
+        return None;
+    }
+    let mut buffer = vec![0u16; 32_767];
+    let mut info = SystemProcessIdInformation {
+        process_id: pid as usize as HANDLE,
+        image_name: UNICODE_STRING { Length: 0, MaximumLength: (buffer.len() * 2) as u16, Buffer: buffer.as_mut_ptr() },
+    };
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_PROCESS_ID_INFORMATION,
+            &mut info as *mut SystemProcessIdInformation as *mut c_void,
+            size_of::<SystemProcessIdInformation>() as u32,
+            null_mut(),
+        )
+    };
+    if status < 0 || info.image_name.Length == 0 {
+        return None;
+    }
+    let len = (info.image_name.Length as usize / 2).min(buffer.len());
+    let path = crate::winutil::device_path_to_dos(&String::from_utf16_lossy(&buffer[..len]), &crate::winutil::dos_devices());
+    Some(path)
+}
+
+/// lsass.exe keeps sign-in secrets. Windows credential-theft protection flags any
+/// tool that opens it for memory reads, so the memory-reading checks skip it.
+pub fn is_credential_store(path: &str) -> bool {
+    crate::winutil::system_directory().is_some_and(|dir| path.eq_ignore_ascii_case(&format!("{dir}\\lsass.exe")))
+}
+
 /// `DOMAIN\\user` owning the process, from its token (query rights only).
 unsafe fn process_user(process: HANDLE) -> Option<String> {
     use windows_sys::Win32::Security::{GetTokenInformation, LookupAccountSidW, TOKEN_QUERY, TOKEN_USER, TokenUser};
@@ -347,7 +437,7 @@ impl Monitor {
                 let name = from_wide(&entry.szExeFile);
                 let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
                 let mut identity = ProcessIdentity { pid, creation_time: 0 };
-                let mut path = String::new();
+                let path: String;
                 let mut cpu_percent = 0.0;
                 let mut memory_bytes = 0;
                 let mut priority_class = 0;
@@ -385,7 +475,7 @@ impl Monitor {
                     counters.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
                     if GetProcessMemoryInfo(handle.0, &mut counters, counters.cb) != 0 {
                         memory_bytes = counters.WorkingSetSize as u64;
-                    } else {
+                    } else if !is_credential_store(&path) {
                         // Older Windows versions can require QUERY_INFORMATION | VM_READ.
                         let memory_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
                         if !memory_handle.is_null() {
@@ -397,6 +487,9 @@ impl Monitor {
                             }
                         }
                     }
+                } else {
+                    // Refuses even query-only handles: ask the kernel for the path instead.
+                    path = image_path_by_pid(pid).unwrap_or_default();
                 }
                 let mut session_id = u32::MAX;
                 ProcessIdToSessionId(pid, &mut session_id);
@@ -442,6 +535,9 @@ pub fn process_modules(identity: &ProcessIdentity) -> SystemResult<Vec<ModuleInf
         let creation = process_times(process.0).ok_or_else(|| last_error("Read module process identity"))?.0;
         if identity.creation_time == 0 || identity.creation_time != creation {
             return Err("Process identity changed; refresh before inspecting modules".into());
+        }
+        if is_credential_store(&image_path(process.0)) {
+            return Err("Not inspected: lsass.exe holds sign-in secrets, and reading its memory trips Windows credential protection".into());
         }
         let snapshot = OwnedHandle::checked(
             CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, identity.pid),
@@ -1003,6 +1099,13 @@ mod tests {
         let snapshot = Monitor::new().refresh().expect("process snapshot");
         let own = snapshot.processes.iter().find(|p| p.identity.pid == std::process::id()).expect("own process");
         assert!(own.identity.creation_time > 0 && !own.path.is_empty());
+        let by_pid = image_path_by_pid(own.identity.pid).expect("path without a handle");
+        assert!(by_pid.eq_ignore_ascii_case(&own.path), "{by_pid} vs {}", own.path);
+        if !is_elevated() {
+            assert!(!enable_debug_privilege(), "only elevated tokens hold SeDebugPrivilege");
+        }
+        let lsass = format!("{}\\LSASS.EXE", crate::winutil::system_directory().unwrap());
+        assert!(is_credential_store(&lsass) && !is_credential_store(&own.path));
         assert!(own.user.contains('\\'), "user is DOMAIN\\name: {}", own.user);
         let exe = std::env::current_exe().unwrap();
         let file = exe.file_name().unwrap().to_string_lossy().to_lowercase();

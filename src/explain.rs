@@ -149,6 +149,58 @@ pub fn explain(f: &Finding) -> Explanation {
                 "Treat as suspicious: check the module named in the detail on VirusTotal; end and quarantine the process if it is not explained.",
             ),
         },
+        "driver_audit" => {
+            if has("signature enforcement is off") {
+                e(
+                    "Windows is loading kernel drivers without checking their signatures. Drivers run with full control of the PC, so this removes one of its main protections. Rootkits and some game cheats turn it off.",
+                    "Unless you turned it off on purpose (driver development), run 'bcdedit' from an administrator prompt to see why, turn enforcement back on and reboot, then scan with Microsoft Defender Offline.",
+                )
+            } else if has("Test-signing") {
+                e(
+                    "Windows accepts drivers signed with test certificates that anyone can make. Developers use this; so do rootkits and some cheat or modding tools.",
+                    "If you did not enable it, run 'bcdedit /set testsigning off' from an administrator prompt, reboot, and check which drivers needed it.",
+                )
+            } else if has("Kernel debugging") {
+                e(
+                    "Kernel debugging is enabled. It lets a debugger control Windows and relaxes some driver protections.",
+                    "If you don't debug Windows, run 'bcdedit /debug off' from an administrator prompt and reboot.",
+                )
+            } else if has("Memory integrity") {
+                e(
+                    "Memory integrity (core isolation) is off. It uses virtualization to stop drivers from being tampered with and to block incompatible or vulnerable ones. Many gaming PCs have it off for older drivers or performance.",
+                    "Optional: turn it on in Windows Security > Device security > Core isolation. Windows lists any drivers that prevent it.",
+                )
+            } else if has("blocklist") {
+                e(
+                    "Microsoft's list of known-vulnerable drivers is not being enforced, so Windows will load drivers that attackers abuse to take over the kernel.",
+                    "Turn 'Microsoft Vulnerable Driver Blocklist' back on in Windows Security > Device security > Core isolation.",
+                )
+            } else if has("Known-abusable") {
+                e(
+                    "This driver's file name matches one publicly documented as abused by attackers: a legitimate but flawed driver they load to gain kernel access ('bring your own vulnerable driver'). Hardware monitors, RGB and overclocking tools often install such drivers.",
+                    "If it belongs to software you use (fan control, RGB, overclocking), update that software or uninstall it when you don't need it. If you don't recognise it, check the file on VirusTotal and investigate how it got there.",
+                )
+            } else if has("file is missing") {
+                e(
+                    "A driver is loaded in the kernel but its file is gone and no driver registration points to it. Rootkits clean up after loading this way; some hardware-info tools do too.",
+                    "If you just ran a hardware-info or overclocking tool, it may be that. Otherwise investigate, and scan with Microsoft Defender Offline.",
+                )
+            } else if has("signature does not verify") || has("no trusted signature") {
+                e(
+                    "A loaded kernel driver has no trusted signature, even though Windows normally refuses those. The file may have been changed after it loaded, or enforcement was bypassed.",
+                    "Treat as serious: check the file on VirusTotal and scan with Microsoft Defender Offline.",
+                )
+            } else if has("user-writable") {
+                e("A kernel driver was loaded from a folder ordinary programs can write to. Legitimate drivers almost never live there.", "Check the file on VirusTotal and investigate how it was loaded.")
+            } else if has("without a driver registration") {
+                e(
+                    "A driver is loaded in the kernel but no registered driver points to it. Some hardware, overclocking and anti-cheat tools load drivers this way; so do rootkits.",
+                    "Check the file's signer and whether it belongs to a tool you use. If not, look it up on VirusTotal.",
+                )
+            } else {
+                general(f)
+            }
+        }
         "module_audit" => e(
             "A signed program has loaded a DLL that is unsigned (or badly signed) from a Temp or user folder. This is how 'DLL side-loading' attacks hide inside trusted programs.",
             "Check the DLL named in the detail on VirusTotal. If it is unknown, end the process and quarantine the DLL's program.",
@@ -172,6 +224,11 @@ pub fn explain(f: &Finding) -> Explanation {
                 e("A service or startup file's signature is broken: it may have been changed after signing.", "Re-install the software it belongs to, or investigate if unknown.")
             } else if has("temp/download") {
                 e("Something set to run automatically lives in a Temp or Downloads folder, which programs rarely do on purpose.", "Investigate; remove the entry if you don't recognise it.")
+            } else if has("outside Windows and Program Files") {
+                e(
+                    "A running driver loads from an unusual folder, not from Windows or Program Files. Games and tools on other drives sometimes do this.",
+                    "Check that the folder belongs to software you use and that the file is signed.",
+                )
             } else if has("user-writable") || has("unsigned") {
                 e(
                     "Something set to run automatically is unsigned or lives in a folder any program can write to, so it is easy to swap for something else.",
@@ -209,6 +266,8 @@ mod tests {
         assert!(explain(&f("ntdll_sweep", Severity::Info, "ntdll functions redirected into app.exe")).meaning.contains("sandbox"));
         assert!(explain(&f("persistence_audit", Severity::Medium, "Startup entry runs a .vbs script")).meaning.contains("script"));
         assert!(explain(&f("module_audit", Severity::High, "Signed process loaded an unsigned DLL")).meaning.contains("side-loading"));
+        assert!(explain(&f("driver_audit", Severity::Medium, "Known-abusable driver is loaded: RTCore64.sys")).meaning.contains("bring your own"));
+        assert!(explain(&f("driver_audit", Severity::High, "Test-signing mode is on")).next_steps.contains("testsigning off"));
     }
 
     #[test]

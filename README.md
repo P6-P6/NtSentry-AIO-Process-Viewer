@@ -7,7 +7,7 @@ A Windows utility that looks for signs of userland tampering and shows them, tog
 - **Menu bar:** File (exports, data folder, findings log), Edit (copy, open file location), View (refresh, pause, filters, zoom, theme), Scan, Baseline, Settings, Help.
 - **Findings pane** (always visible): everything the scans found, most severe first. **NEW** marks findings that were not in the previous scan of the same kind; the previous scan is read from the log, so this works across restarts.
 - **Inventory tabs:** Processes (live CPU, memory, threads, session, user, start time and, optionally, command line), Services, Drivers, Startup, Connections and Quarantine. Every entry is shown. Click a column header to sort. Processes, services, drivers and startup entries carry a **Flag** column with their worst finding.
-- **Columns:** right-click a row or a column header > Columns to show or hide columns. Copies and exports include only the shown columns; the full JSON report always has everything.
+- **Columns:** right-click a column header > Columns to show or hide columns. Copies and exports include only the shown columns; the full JSON report always has everything.
 - **Selecting rows:** click, Ctrl+click, Shift+click, arrow keys and Shift+arrow keys, Home/End, PageUp/PageDown, Ctrl+A for all. Ctrl+C copies the selected rows as tab-separated text; right-click acts on all selected rows.
 - **Process tree:** View > Process tree (or the Tree box) shows parent/child relationships. A parent that started after its child is a reused PID, so that child is shown as a root. Sorting is off in tree view.
 - **Details pane:** click any row. Findings come with a plain-English **What this means / What you can do** section. Other rows list their related findings; a process also shows its user, start time, command line, file version information, loaded modules and network endpoints.
@@ -57,6 +57,7 @@ Exports use a Save As dialog. The options are the current view as CSV, findings 
 | **ntdll across processes** | ntdll's code in every readable process, compared with the dashboard's own copy. Shared image pages only differ after a write, so differences are modifications. Each hook's jump target is decoded and attributed to the module (or anonymous memory) that owns it. The program's own signed code, typical of browser and Electron sandboxes, is Info; other signed modules in Program Files or Windows are Low; memory not backed by a file is Medium; unsigned, untrusted, or temp/user-folder modules are High. One finding per process and owner. |
 | **Loaded modules** | Signed processes that loaded an unsigned, untrusted or invalidly signed DLL from a temp or user-writable folder (side-loading or injection). Only DLLs in those folders are signature-checked, so the scan is fast. |
 | **Persistence** | Services, drivers and startup entries: missing files (a running driver whose file is gone is High), temp or user-writable locations, signatures, URLs in commands, script hosts and startup scripts. Startup-folder shortcuts are resolved to their targets. Stopped drivers are checked for location only. |
+| **Drivers** | Runs with the persistence audit. How Windows guards drivers: signature enforcement off (Critical), test signing (High), kernel debugging (Medium), Memory integrity off (Low), vulnerable-driver blocklist off (Medium). Every kernel module actually loaded is compared with the registered drivers: one loaded without a registration from outside Windows is Medium, from a user-writable folder or with a missing file or untrusted signature High. Driver files whose names match a short built-in list of drivers publicly documented as abused for kernel access are Medium when loaded and Low when only installed; a name match is a lead, not proof. A running driver from outside Windows and Program Files is Low. |
 | **Process lineage** (part of the process scan) | Office starting a shell or script host; browsers starting script hosts; `svchost`, `lsass`, `lsaiso` or `services` with an unexpected parent. |
 
 Signature results are cached across all scans. *Untrusted* (self-signed, expired or unknown root) is graded like unsigned. *Invalid* covers a changed file, a revoked or distrusted certificate, or another verification failure, and is High. A file that could not be read counts as "not checked", not as invalid.
@@ -78,6 +79,7 @@ When enabled, new findings go to the Application log under source `NtSentry`, ev
 | `src/system.rs` | Windows inventories (live process metrics, services, drivers, startup entries, connections, modules, file version info) and the guarded end/suspend/resume controls |
 | `src/inventory.rs` | Inventory collection; command-line and shortcut resolution |
 | `src/persistence_audit.rs` | Services, drivers and startup entries |
+| `src/driver_audit.rs` | Code integrity state, loaded kernel modules and known-abusable drivers |
 | `src/module_audit.rs` | Unsigned DLLs in signed processes |
 | `src/eventlog.rs` | Opt-in Application event log output |
 | `src/quarantine.rs` | Restorable quarantine |
@@ -129,7 +131,7 @@ When enabled, new findings go to the Application log under source `NtSentry`, ev
 | Unsigned image elsewhere | Low |
 | Signed image in Temp / Downloads | Low |
 
-Protected processes are listed as "access denied" without a finding; running as administrator shows more. Signature results are cached by path, size, and modification time.
+Run as administrator, NtSentry turns on the debug privilege (as Task Manager and Process Explorer do) so query-only handles open for service and protected processes; the status bar says whether it runs as administrator. A process that still refuses access (some anti-cheat protected ones) gets its path from a handle-free kernel query, so its file and signature are still checked; its user, CPU and memory stay blank. The memory-reading checks (ntdll sweep, module audit) skip lsass.exe: it holds sign-in secrets, and Windows credential-theft protection flags any tool that opens it for reading. Signature results are cached by path, size, and modification time.
 
 ## Baseline
 

@@ -178,13 +178,15 @@ struct Confirm {
 
 /// Right-click menu for a row. `targets` are the PIDs a process action applies to
 /// (all selected processes when the row is part of a multi-selection); `suspended`
-/// holds PIDs the dashboard suspended; `selected` is how many rows are selected.
+/// holds PIDs the dashboard suspended; `selected` is how many rows are selected;
+/// `has_file` says whether a process or finding row points at a file.
 fn row_menu(
     ui: &mut egui::Ui,
     selection: &Selection,
     targets: &[u32],
     suspended: &HashSet<u32>,
     selected: usize,
+    has_file: bool,
 ) -> Option<RowAction> {
     let mut chosen = None;
     if matches!(selection, Selection::Process(_)) && !targets.is_empty() {
@@ -231,7 +233,7 @@ fn row_menu(
     if ui.button("Copy details").clicked() {
         chosen = Some(RowAction::Copy(selection.clone()));
     }
-    let has_file = matches!(selection, Selection::Process(_) | Selection::Service(_) | Selection::Driver(_) | Selection::Startup(_));
+    let has_file = has_file || matches!(selection, Selection::Service(_) | Selection::Driver(_) | Selection::Startup(_));
     if has_file {
         if ui.button("Open file location").clicked() {
             chosen = Some(RowAction::OpenLocation(selection.clone()));
@@ -310,11 +312,13 @@ struct Row {
     system: bool,
     /// Processes only: highest finding severity.
     severity: Option<Severity>,
+    /// Processes and findings: there is a file for "Open file location".
+    has_file: bool,
 }
 
 impl Row {
     fn new(key: Selection, cells: Vec<Cell>) -> Self {
-        Row { key, cells, system: false, severity: None }
+        Row { key, cells, system: false, severity: None, has_file: false }
     }
 
     fn texts(&self) -> Vec<&str> {
@@ -404,7 +408,7 @@ fn render_table(
     sort: (usize, bool),
     marked: &HashSet<Selection>,
     scroll_to: Option<usize>,
-    menu: &dyn Fn(&mut egui::Ui, &Selection) -> Option<RowAction>,
+    menu: &dyn Fn(&mut egui::Ui, &Row) -> Option<RowAction>,
 ) -> TableOutput {
     let mut out = TableOutput::default();
     let mut builder = TableBuilder::new(ui)
@@ -424,25 +428,26 @@ fn render_table(
         .header(ROW_HEIGHT + 2.0, |mut header| {
             for &i in cols {
                 let title = spec.columns[i].0;
-                header.col(|ui| {
+                let (_, response) = header.col(|ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
-                        let button = egui::Button::new(RichText::new(title).strong()).frame(false);
-                        let response = ui.add(button).on_hover_text("Click to sort; right-click to choose columns");
-                        if response.clicked() {
-                            out.sort_clicked = Some(i);
-                        }
-                        response.context_menu(|ui| {
-                            if let Some(action) = columns_menu(ui, spec, cols) {
-                                out.action = Some(action);
-                                ui.close();
-                            }
-                        });
+                        ui.add(egui::Label::new(RichText::new(title).strong()).selectable(false));
                         // Arrows exist only in the bundled monospace font.
                         if sort.0 == i {
-                            ui.label(RichText::new(if sort.1 { "↑" } else { "↓" }).monospace().strong());
+                            ui.add(egui::Label::new(RichText::new(if sort.1 { "↑" } else { "↓" }).monospace().strong()).selectable(false));
                         }
                     });
+                });
+                // The whole header cell sorts on click and offers the column chooser on right-click.
+                let response = response.on_hover_text("Click to sort; right-click to choose columns");
+                if response.clicked() {
+                    out.sort_clicked = Some(i);
+                }
+                response.context_menu(|ui| {
+                    if let Some(action) = columns_menu(ui, spec, cols) {
+                        out.action = Some(action);
+                        ui.close();
+                    }
                 });
             }
         })
@@ -461,11 +466,7 @@ fn render_table(
                     out.clicked = Some((row.key.clone(), modifiers, response.secondary_clicked()));
                 }
                 response.context_menu(|ui| {
-                    let chosen = menu(ui, &row.key).or_else(|| {
-                        ui.separator();
-                        columns_menu(ui, spec, cols)
-                    });
-                    if let Some(action) = chosen {
+                    if let Some(action) = menu(ui, row) {
                         out.action = Some(action);
                         ui.close();
                     }
@@ -561,6 +562,8 @@ pub struct Dashboard {
     confirm: Option<Confirm>,
     quarantine: Vec<QuarantineEntry>,
     has_baseline: bool,
+    /// Running as administrator; otherwise some processes can't be read.
+    elevated: bool,
     save_job: Option<SaveJob>,
     start_minimized: bool,
     last_ctx_zoom: f32,
@@ -602,6 +605,7 @@ impl Dashboard {
             ctx,
             worker,
             has_baseline: data.has_baseline(),
+            elevated: ntsentry::system::is_elevated(),
             data,
             saved_settings: settings.clone(),
             settings,
@@ -875,7 +879,8 @@ impl Dashboard {
             .filter(|f| f.severity >= self.min_severity)
             .map(|f| {
                 let new = self.new_keys.contains(&f.stable_key());
-                Row::new(
+                let has_file = f.file.is_some() || f.pid().is_some() || f.subject.starts_with("ntdll.dll");
+                let row = Row::new(
                     Selection::Finding(f.row_key()),
                     vec![
                         Cell::severity(Some(f.severity)),
@@ -888,7 +893,8 @@ impl Dashboard {
                         Cell::text(f.observed.clone().unwrap_or_default()).mono(),
                         Cell::text(&f.detail),
                     ],
-                )
+                );
+                Row { has_file, ..row }
             })
             .collect()
     }
@@ -1032,7 +1038,7 @@ impl Dashboard {
             Cell::text(live.map(|p| p.command_line.clone()).unwrap_or_default()),
             Cell::text(path_shown),
         ];
-        Row { key: Selection::Process(pid), cells, system: self.is_system(pid, &path), severity }
+        Row { key: Selection::Process(pid), cells, system: self.is_system(pid, &path), severity, has_file: !path.is_empty() }
     }
 
     fn tab_rows(&self, tab: Tab) -> Vec<Row> {
@@ -1770,7 +1776,10 @@ impl Dashboard {
                 .map(|p| p.path.clone())
                 .filter(|p| !p.is_empty())
                 .or_else(|| self.records_by_pid().get(pid).and_then(|r| r.path.clone())),
-            Selection::Finding(_) => self.selection_pid(selection).and_then(|pid| self.selection_path(&Selection::Process(pid))),
+            Selection::Finding(key) => {
+                let finding = self.all_findings().into_iter().find(|f| &f.row_key() == key)?;
+                self.finding_file(finding)
+            }
             Selection::Service(name) | Selection::Driver(name) => {
                 let inv = self.inventory.as_ref()?;
                 let list = if matches!(selection, Selection::Driver(_)) { &inv.drivers } else { &inv.services };
@@ -1781,6 +1790,23 @@ impl Dashboard {
             Selection::Quarantined(_) => None,
         };
         path.filter(|p| !p.is_empty())
+    }
+
+    /// The file a finding is about: the one it names, else its process's image
+    /// while a process with that PID and name still exists, else ntdll itself.
+    fn finding_file(&self, f: &Finding) -> Option<String> {
+        if let Some(file) = &f.file {
+            return Some(file.clone());
+        }
+        if let Some(pid) = f.pid() {
+            let name = f.subject.splitn(3, ' ').nth(2).unwrap_or("");
+            let same = self.process_name(pid).is_some_and(|n| n.eq_ignore_ascii_case(name));
+            return if same { self.selection_path(&Selection::Process(pid)) } else { None };
+        }
+        if f.subject.starts_with("ntdll.dll") {
+            return ntsentry::winutil::system_directory().map(|d| format!("{d}\\ntdll.dll"));
+        }
+        None
     }
 
     /// A process related to the selection, for "Show process".
@@ -2408,6 +2434,14 @@ impl Dashboard {
             ui.separator();
             ui.label(if self.has_baseline { "Baseline: present" } else { "Baseline: none" });
             ui.separator();
+            if self.elevated {
+                ui.label("Administrator");
+            } else {
+                ui.label(RichText::new("Not running as administrator").color(severity_color(Severity::Medium))).on_hover_text(
+                    "Some processes, services and drivers can't be read. Right-click NtSentry > Run as administrator to see everything.",
+                );
+            }
+            ui.separator();
             ui.label(RichText::new("Scans are read-only; actions ask first").weak());
         });
     }
@@ -2521,7 +2555,7 @@ impl Dashboard {
             ui.label("• The tabs below show every process, service, driver, startup entry and network endpoint. Click a column header to sort.");
             ui.label("• Click any row to see its full details on the right; Esc clears the selection.");
             ui.label("• Select several rows: Ctrl+click, Shift+click, Shift+arrow keys, or Ctrl+A for all. Ctrl+C copies them; right-click for actions on all of them.");
-            ui.label("• Right-click a row or a column header > Columns to show or hide columns. Copies and exports include only the shown columns.");
+            ui.label("• Right-click a column header to show or hide columns. Copies and exports include only the shown columns.");
             ui.label("• Click a finding to read what it means and what you can do about it.");
             ui.label("• Right-click a process to end, suspend/resume, or end it and quarantine its file. Restore from the Quarantine tab.");
             ui.label("• Find (Ctrl+F) filters the findings and the current tab by any text: name, PID, path…");
@@ -2785,14 +2819,15 @@ impl eframe::App for Dashboard {
         let mut marked_pids: Vec<u32> =
             marked.iter().filter_map(|s| if let Selection::Process(p) = s { Some(*p) } else { None }).collect();
         marked_pids.sort_unstable();
-        let menu = |ui: &mut egui::Ui, selection: &Selection| {
+        let menu = |ui: &mut egui::Ui, row: &Row| {
+            let selection = &row.key;
             let targets = match selection {
                 Selection::Process(_) if marked_pids.len() > 1 && marked.contains(selection) => marked_pids.clone(),
                 Selection::Process(pid) => vec![*pid],
                 _ => Vec::new(),
             };
             let selected = if marked.contains(selection) { marked.len() } else { 1 };
-            row_menu(ui, selection, &targets, &suspended, selected)
+            row_menu(ui, selection, &targets, &suspended, selected, row.has_file)
         };
         egui::CentralPanel::default().show(ui, |ui| {
             self.summary(ui);
@@ -2870,15 +2905,15 @@ mod tests {
         spec: &Spec,
         clicks: &[Pos2],
         pointer: egui::PointerButton,
-    ) -> (Vec<Selection>, Vec<usize>, Vec<Selection>) {
+    ) -> (Vec<Selection>, Vec<usize>, Vec<Selection>, bool) {
         let ctx = egui::Context::default();
         let refs: Vec<&Row> = rows.iter().collect();
         let mut selected = Vec::new();
         let mut sorted = Vec::new();
         // Rows whose right-click menu was drawn.
         let menus = std::cell::RefCell::new(Vec::new());
-        let menu = |_: &mut egui::Ui, s: &Selection| {
-            menus.borrow_mut().push(s.clone());
+        let menu = |_: &mut egui::Ui, r: &Row| {
+            menus.borrow_mut().push(r.key.clone());
             None
         };
         let mut frame = |events: Vec<egui::Event>| {
@@ -2912,7 +2947,7 @@ mod tests {
         }
         let mut opened = menus.into_inner();
         opened.dedup();
-        (selected, sorted, opened)
+        (selected, sorted, opened, egui::Popup::is_any_open(&ctx))
     }
 
     fn sample() -> (Vec<Row>, Spec) {
@@ -2933,7 +2968,7 @@ mod tests {
         let (rows, spec) = sample();
         // Header is about ROW_HEIGHT + 2 tall; the third row starts near y = 2.5 rows down.
         let third_row_y = (ROW_HEIGHT + 2.0) + 2.5 * (ROW_HEIGHT + 3.0);
-        let (selected, _, menus) =
+        let (selected, _, menus, _) =
             run_frames(&rows, &spec, &[pos2(20.0, third_row_y), pos2(300.0, third_row_y)], egui::PointerButton::Primary);
         assert_eq!(selected, vec![Selection::Process(3), Selection::Process(3)], "clicks on the PID text and on the name cell");
         assert!(menus.is_empty(), "a left click opens no menu");
@@ -2943,7 +2978,7 @@ mod tests {
     fn right_clicking_a_row_selects_it_and_opens_its_menu() {
         let (rows, spec) = sample();
         let second_row_y = (ROW_HEIGHT + 2.0) + 1.5 * (ROW_HEIGHT + 3.0);
-        let (selected, _, menus) = run_frames(&rows, &spec, &[pos2(200.0, second_row_y)], egui::PointerButton::Secondary);
+        let (selected, _, menus, _) = run_frames(&rows, &spec, &[pos2(200.0, second_row_y)], egui::PointerButton::Secondary);
         assert_eq!(selected, vec![Selection::Process(2)]);
         assert_eq!(menus, vec![Selection::Process(2)], "the menu is built for the row that was right-clicked");
     }
@@ -2951,9 +2986,21 @@ mod tests {
     #[test]
     fn clicking_a_header_requests_sorting() {
         let (rows, spec) = sample();
-        let (selected, sorted, _) = run_frames(&rows, &spec, &[pos2(140.0, 8.0)], egui::PointerButton::Primary);
+        let (selected, sorted, _, _) = run_frames(&rows, &spec, &[pos2(140.0, 8.0)], egui::PointerButton::Primary);
         assert!(selected.is_empty());
         assert_eq!(sorted, vec![1]);
+        // Anywhere in the header cell, not only on its text.
+        let (_, sorted, _, _) = run_frames(&rows, &spec, &[pos2(400.0, 8.0)], egui::PointerButton::Primary);
+        assert_eq!(sorted, vec![1]);
+    }
+
+    #[test]
+    fn right_clicking_a_header_opens_only_the_column_chooser() {
+        let (rows, spec) = sample();
+        let (selected, sorted, menus, popup) = run_frames(&rows, &spec, &[pos2(400.0, 8.0)], egui::PointerButton::Secondary);
+        assert!(selected.is_empty() && sorted.is_empty());
+        assert!(menus.is_empty(), "no row menu for the header");
+        assert!(popup, "the column chooser opened");
     }
 
     #[test]

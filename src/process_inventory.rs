@@ -359,7 +359,10 @@ impl ProcessInventory {
                 report.processes.push(record);
                 continue;
             }
-            match image_path(p.pid) {
+            // A process that refuses even a query-only handle still has its path read by PID.
+            let resolved = image_path(p.pid)
+                .or_else(|e| crate::system::image_path_by_pid(p.pid).map(|path| (path, None)).ok_or(e));
+            match resolved {
                 // Minimal processes (Registry, Memory Compression, Secure System) report a bare name.
                 Ok((path, created)) if !path.contains('\\') => {
                     record.created_filetime = created;
@@ -367,13 +370,20 @@ impl ProcessInventory {
                 }
                 Ok((path, created)) => {
                     let sig = cache.get(&path);
-                    let (class, findings) = assess(p.pid, &p.name, &path, sig.as_ref(), &dirs);
+                    let (class, mut findings) = assess(p.pid, &p.name, &path, sig.as_ref(), &dirs);
+                    for f in &mut findings {
+                        f.file = Some(path.clone());
+                    }
                     record.max_severity = findings.iter().map(|f| f.severity).max();
                     record.path_class = Some(class);
                     record.signature = sig;
                     record.created_filetime = created;
                     record.path = Some(path);
                     report.findings.extend(findings);
+                }
+                // Virtualization-based security's isolated process has no image to read.
+                Err(_) if p.parent_pid == 4 && p.name == "Secure System" => {
+                    record.path_error = Some("minimal process (Secure System)".into());
                 }
                 Err(e) => {
                     report.inaccessible += 1;

@@ -16,7 +16,7 @@ use crate::findings::{Finding, Severity, sort_findings};
 use crate::pe::{Export, ImageIdentity, OverrideSite, PeImage, unrelocate};
 use crate::signature::{SignatureInfo, SignatureState, signature_info};
 use crate::storage::{DataDir, write_new};
-use crate::winutil::{from_wide, hex, now_unix, sha256_hex, system_directory, wide};
+use crate::winutil::{device_path_to_dos, dos_devices, from_wide, hex, now_unix, sha256_hex, system_directory, wide};
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -997,22 +997,6 @@ pub fn grade_hook_owner(
     }
 }
 
-/// `\Device\HarddiskVolume3` -> `C:` for every drive letter.
-fn dos_devices() -> Vec<(String, String)> {
-    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
-    let mut out = Vec::new();
-    for letter in b'A'..=b'Z' {
-        let drive = format!("{}:", letter as char);
-        let name = wide(&drive);
-        let mut buffer = [0u16; 1024];
-        let len = unsafe { QueryDosDeviceW(name.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
-        if len > 0 {
-            out.push((from_wide(&buffer), drive));
-        }
-    }
-    out
-}
-
 fn hook_owner(process: windows_sys::Win32::Foundation::HANDLE, address: u64, devices: &[(String, String)]) -> HookOwner {
     use windows_sys::Win32::System::Memory::VirtualQueryEx;
     use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
@@ -1031,15 +1015,7 @@ fn hook_owner(process: windows_sys::Win32::Foundation::HANDLE, address: u64, dev
     if len == 0 {
         return HookOwner::Unknown;
     }
-    let device_path = from_wide(&buffer[..len as usize]);
-    let path = devices
-        .iter()
-        .find_map(|(device, drive)| {
-            let rest = device_path.strip_prefix(device.as_str())?;
-            rest.starts_with('\\').then(|| format!("{drive}{rest}"))
-        })
-        .unwrap_or(device_path);
-    HookOwner::Image(path)
+    HookOwner::Image(device_path_to_dos(&from_wide(&buffer[..len as usize]), devices))
 }
 
 struct OwnerGroup {
@@ -1093,8 +1069,15 @@ pub fn sweep_processes(
     let devices = dos_devices();
     let own = std::process::id();
     let (mut compared, mut denied, mut other_build, mut differing, mut foreign) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut skipped = 0usize;
     for (pid, name) in processes {
         if *pid == 0 || *pid == 4 || *pid == own {
+            continue;
+        }
+        let process_path =
+            crate::process_inventory::image_path(*pid).ok().map(|(p, _)| p).or_else(|| crate::system::image_path_by_pid(*pid));
+        if process_path.as_deref().is_some_and(crate::system::is_credential_store) {
+            skipped += 1;
             continue;
         }
         let mut handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, *pid) };
@@ -1117,7 +1100,6 @@ pub fn sweep_processes(
             continue;
         }
         compared += 1;
-        let process_path = crate::process_inventory::image_path(*pid).ok().map(|(p, _)| p);
         let subject = format!("pid {pid} {name}");
         let mut groups: Vec<OwnerGroup> = Vec::new();
         let mut undecoded = Vec::new();
@@ -1220,9 +1202,12 @@ pub fn sweep_processes(
             );
         }
     }
-    let summary = format!(
+    let mut summary = format!(
         "ntdll sweep: {compared} processes compared, {differing} modified ({foreign} with hooks not explained as the program's own code), {denied} not readable, {other_build} on another ntdll build"
     );
+    if skipped > 0 {
+        summary.push_str(", lsass.exe skipped (credential store)");
+    }
     findings.push(Finding::new(SWEEP_MODULE, Severity::Info, "process snapshot", "ntdll sweep summary").detail(summary.clone()));
     sort_findings(&mut findings);
     crate::findings::ScanReport {

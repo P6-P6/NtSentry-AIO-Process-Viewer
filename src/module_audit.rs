@@ -49,6 +49,7 @@ pub fn assess(
     };
     Some(
         Finding::new(MODULE, severity, format!("pid {} {}", process.pid, process.name), format!("Signed process loaded an {what}{place}"))
+            .file(module_path)
             .detail(format!(
                 "Module {module_path} in {} ({}).",
                 process.path.as_deref().unwrap_or("?"),

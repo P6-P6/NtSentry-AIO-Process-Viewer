@@ -19,6 +19,8 @@ Data directory: %NTSENTRY_DATA% or %LOCALAPPDATA%\\NtSentry.\n\
 Output files are never overwritten.";
 
 fn main() {
+    // Elevated runs see every process, as in Task Manager; otherwise a no-op.
+    ntsentry::system::enable_debug_privilege();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let data = match DataDir::default_location() {
         Ok(d) => d,

@@ -77,6 +77,33 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// `\Device\HarddiskVolume3` -> `C:` for every drive letter.
+pub fn dos_devices() -> Vec<(String, String)> {
+    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let mut out = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let drive = format!("{}:", letter as char);
+        let name = wide(&drive);
+        let mut buffer = [0u16; 1024];
+        let len = unsafe { QueryDosDeviceW(name.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+        if len > 0 {
+            out.push((from_wide(&buffer), drive));
+        }
+    }
+    out
+}
+
+/// `\Device\HarddiskVolume3\x.exe` -> `C:\x.exe`; unchanged when no drive matches.
+pub fn device_path_to_dos(device_path: &str, devices: &[(String, String)]) -> String {
+    devices
+        .iter()
+        .find_map(|(device, drive)| {
+            let rest = device_path.strip_prefix(device.as_str())?;
+            rest.starts_with('\\').then(|| format!("{drive}{rest}"))
+        })
+        .unwrap_or_else(|| device_path.to_string())
+}
+
 /// SHA-256 of a file, read in 1 MiB chunks.
 pub fn sha256_file(path: &str) -> Result<String, String> {
     use sha2::{Digest, Sha256};
@@ -116,6 +143,13 @@ mod tests {
         std::fs::write(&path, b"abc").unwrap();
         assert_eq!(sha256_file(&path.to_string_lossy()).unwrap(), sha256_hex(b"abc"));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn device_paths_map_to_drive_letters() {
+        let devices = vec![(r"\Device\HarddiskVolume3".to_string(), "C:".to_string())];
+        assert_eq!(device_path_to_dos(r"\Device\HarddiskVolume3\Windows\x.exe", &devices), r"C:\Windows\x.exe");
+        assert_eq!(device_path_to_dos(r"\Device\HarddiskVolume30\x.exe", &devices), r"\Device\HarddiskVolume30\x.exe");
     }
 
     #[test]
