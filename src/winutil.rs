@@ -77,6 +77,23 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// SHA-256 of a file, read in 1 MiB chunks.
+pub fn sha256_file(path: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("Cannot open {path}: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buffer).map_err(|e| format!("Cannot read {path}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
@@ -91,6 +108,14 @@ mod tests {
         assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_utc(951_782_400), "2000-02-29 00:00:00 UTC");
         assert_eq!(format_utc(1_793_646_600), "2026-11-02 19:10:00 UTC");
+    }
+
+    #[test]
+    fn file_hash_matches_memory_hash() {
+        let path = std::env::temp_dir().join(format!("ntsentry-hash-{}.bin", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(sha256_file(&path.to_string_lossy()).unwrap(), sha256_hex(b"abc"));
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

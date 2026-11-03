@@ -55,6 +55,10 @@ pub struct ProcessInfo {
     /// True only when the API positively reports critical status.
     pub is_critical: bool,
     pub accessible: bool,
+    /// `DOMAIN\\user` that owns the process; empty when not readable.
+    pub user: String,
+    /// Full command line; empty when not readable.
+    pub command_line: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -187,6 +191,104 @@ unsafe fn image_path(handle: HANDLE) -> String {
     }
 }
 
+/// `DOMAIN\\user` owning the process, from its token (query rights only).
+unsafe fn process_user(process: HANDLE) -> Option<String> {
+    use windows_sys::Win32::Security::{GetTokenInformation, LookupAccountSidW, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let token = OwnedHandle(token);
+        let mut needed = 0u32;
+        GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed);
+        if needed == 0 || needed > 4096 {
+            return None;
+        }
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        if GetTokenInformation(token.0, TokenUser, buffer.as_mut_ptr() as *mut c_void, needed, &mut needed) == 0 {
+            return None;
+        }
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let (mut name, mut domain) = ([0u16; 256], [0u16; 256]);
+        let (mut name_len, mut domain_len) = (name.len() as u32, domain.len() as u32);
+        let mut kind = 0;
+        if LookupAccountSidW(
+            null(),
+            user.User.Sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        ) == 0
+        {
+            return None;
+        }
+        let (name, domain) = (from_wide(&name), from_wide(&domain));
+        Some(if domain.is_empty() { name } else { format!("{domain}\\{name}") })
+    }
+}
+
+/// Command line of a process (Windows 8.1+, query rights only).
+unsafe fn process_command_line(process: HANDLE) -> Option<String> {
+    use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
+    unsafe {
+        let mut needed = 0u32;
+        NtQueryInformationProcess(process, ProcessCommandLineInformation, null_mut(), 0, &mut needed);
+        if needed == 0 || needed > 1 << 20 {
+            return None;
+        }
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        let status = NtQueryInformationProcess(
+            process,
+            ProcessCommandLineInformation,
+            buffer.as_mut_ptr() as *mut c_void,
+            (buffer.len() * 8) as u32,
+            &mut needed,
+        );
+        if status < 0 {
+            return None;
+        }
+        let text = &*(buffer.as_ptr() as *const UNICODE_STRING);
+        if text.Buffer.is_null() || text.Length == 0 {
+            return Some(String::new());
+        }
+        // The string must lie inside the buffer the kernel filled.
+        let (start, end) = (buffer.as_ptr() as usize, buffer.as_ptr() as usize + buffer.len() * 8);
+        let (ptr, bytes) = (text.Buffer as usize, text.Length as usize);
+        if ptr < start || ptr + bytes > end {
+            return None;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(text.Buffer, bytes / 2)))
+    }
+}
+
+/// FILETIME ticks to Unix seconds.
+pub fn filetime_to_unix(filetime: u64) -> Option<u64> {
+    const EPOCH_DIFFERENCE: u64 = 116_444_736_000_000_000;
+    (filetime > EPOCH_DIFFERENCE).then(|| (filetime - EPOCH_DIFFERENCE) / 10_000_000)
+}
+
+/// Opens the standard Windows Properties dialog for a file.
+pub fn open_file_properties(path: &str) -> SystemResult<()> {
+    use windows_sys::Win32::UI::Shell::{SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW};
+    let file = wide(path);
+    let verb = wide("properties");
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = zeroed();
+        info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_INVOKEIDLIST;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.nShow = 1; // SW_SHOWNORMAL
+        if ShellExecuteExW(&mut info) == 0 {
+            return Err(last_error("Open file properties"));
+        }
+    }
+    Ok(())
+}
+
 /// Saturating deltas prevent bogus spikes across counter resets or failed samples.
 pub fn cpu_from_deltas(process_delta: u64, machine_delta: u64) -> f64 {
     if machine_delta == 0 {
@@ -202,6 +304,8 @@ pub struct Monitor {
     previous_process: HashMap<ProcessIdentity, u64>,
     /// Paths are cached only while the same PID/creation identity lives.
     paths: HashMap<ProcessIdentity, String>,
+    /// User and command line, read once per process.
+    details: HashMap<ProcessIdentity, (String, String)>,
 }
 
 impl Monitor {
@@ -237,6 +341,7 @@ impl Monitor {
             }
             let mut current_times = HashMap::new();
             let mut current_paths = HashMap::new();
+            let mut current_details = HashMap::new();
             while next != 0 {
                 let pid = entry.th32ProcessID;
                 let name = from_wide(&entry.szExeFile);
@@ -247,6 +352,7 @@ impl Monitor {
                 let mut memory_bytes = 0;
                 let mut priority_class = 0;
                 let mut is_critical = false;
+                let (mut user, mut command_line) = (String::new(), String::new());
                 let accessible = !handle.is_null();
                 if accessible {
                     let handle = OwnedHandle(handle);
@@ -264,6 +370,11 @@ impl Monitor {
                     };
                     if identity.creation_time != 0 {
                         current_paths.insert(identity, path.clone());
+                        let details = self.details.get(&identity).cloned().unwrap_or_else(|| {
+                            (process_user(handle.0).unwrap_or_default(), process_command_line(handle.0).unwrap_or_default())
+                        });
+                        (user, command_line) = details.clone();
+                        current_details.insert(identity, details);
                     }
                     priority_class = GetPriorityClass(handle.0);
                     let mut critical = 0;
@@ -302,6 +413,8 @@ impl Monitor {
                     priority_class,
                     is_critical,
                     accessible,
+                    user,
+                    command_line,
                 });
                 next = Process32NextW(snapshot.0, &mut entry);
             }
@@ -312,6 +425,7 @@ impl Monitor {
             self.previous_machine = Some((total, idle_now));
             self.previous_process = current_times;
             self.paths = current_paths;
+            self.details = current_details;
             Ok(output)
         }
     }
@@ -889,6 +1003,12 @@ mod tests {
         let snapshot = Monitor::new().refresh().expect("process snapshot");
         let own = snapshot.processes.iter().find(|p| p.identity.pid == std::process::id()).expect("own process");
         assert!(own.identity.creation_time > 0 && !own.path.is_empty());
+        assert!(own.user.contains('\\'), "user is DOMAIN\\name: {}", own.user);
+        let exe = std::env::current_exe().unwrap();
+        let file = exe.file_name().unwrap().to_string_lossy().to_lowercase();
+        assert!(own.command_line.to_lowercase().contains(&file), "{}", own.command_line);
+        let started = filetime_to_unix(own.identity.creation_time).unwrap();
+        assert!(started <= crate::winutil::now_unix() && started > 1_600_000_000);
         assert!(snapshot.memory_total_bytes > 0 && (0.0..=100.0).contains(&snapshot.cpu_percent));
         let modules = process_modules(&own.identity).expect("own modules");
         assert!(modules.iter().any(|m| m.name.eq_ignore_ascii_case("ntdll.dll")));

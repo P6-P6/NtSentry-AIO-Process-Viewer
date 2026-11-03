@@ -6,20 +6,27 @@ A Windows utility that looks for signs of userland tampering and shows them, tog
 
 - **Menu bar:** File (exports, data folder, findings log), Edit (copy, open file location), View (refresh, pause, filters, zoom, theme), Scan, Baseline, Settings, Help.
 - **Findings pane** (always visible): everything the scans found, most severe first. **NEW** marks findings that were not in the previous scan of the same kind; the previous scan is read from the log, so this works across restarts.
-- **Inventory tabs:** Processes (with live CPU, memory, threads, session), Services, Drivers, Startup, and Connections. Every entry is shown. Click a column header to sort. Processes, services, drivers and startup entries carry a **Flag** column with their worst finding.
+- **Inventory tabs:** Processes (live CPU, memory, threads, session, user, start time and, optionally, command line), Services, Drivers, Startup, Connections and Quarantine. Every entry is shown. Click a column header to sort. Processes, services, drivers and startup entries carry a **Flag** column with their worst finding.
+- **Columns:** right-click a row or a column header > Columns to show or hide columns. Copies and exports include only the shown columns; the full JSON report always has everything.
+- **Selecting rows:** click, Ctrl+click, Shift+click, arrow keys and Shift+arrow keys, Home/End, PageUp/PageDown, Ctrl+A for all. Ctrl+C copies the selected rows as tab-separated text; right-click acts on all selected rows.
 - **Process tree:** View > Process tree (or the Tree box) shows parent/child relationships. A parent that started after its child is a reused PID, so that child is shown as a root. Sorting is off in tree view.
-- **Details pane:** click any row. It lists the row's related findings. For a process it also shows file version information, loaded modules, and network endpoints.
+- **Details pane:** click any row. Findings come with a plain-English **What this means / What you can do** section. Other rows list their related findings; a process also shows its user, start time, command line, file version information, loaded modules and network endpoints.
+- **Files:** Open file location, File properties (the standard Windows dialog), and Look up on VirusTotal, which hashes the file locally and opens your browser at its VirusTotal page. Only the SHA-256 leaves the PC, and only when you click.
 - **Notification area:** a tray icon with Show dashboard / Scan now / Exit. Minimizing hides the window to the tray (setting). The icon turns red and its tooltip shows the alert while one is active.
 - **Find** (Ctrl+F) filters the findings and the current tab by any text.
-- **Shortcuts:** F5 refresh, Ctrl+S export the current view, Ctrl+C copy the selected details, Esc clear the selection.
+- **Shortcuts:** F5 refresh, Ctrl+S export the current view, Ctrl+A select all, Ctrl+C copy, Esc clear the selection.
+- **Layout is remembered:** window size and position, pane sizes, column widths, hidden columns, sort order and the last tab.
+
+Command lines can contain sensitive arguments such as tokens. They are only shown on screen, and only exported when the Command line column is shown.
 
 ### Process actions
 
-Right-click a process, or use the details pane or the Edit menu:
+Right-click a process, or use the details pane or the Edit menu. With several processes selected, an action applies to all of them after one confirmation:
 
 | Action | What happens |
 |---|---|
 | **End process…** | Asks first, then ends the process and waits up to 5 s for it to exit. |
+| **End process tree…** | Asks first, listing every process, then ends the process and everything it started, children first. A "parent" that started after its child is a reused PID and is not followed. |
 | **Suspend / Resume** | Suspends every thread. Only threads the dashboard suspended are ever resumed, and everything still suspended is resumed when the dashboard exits. |
 | **End and quarantine file…** | Asks first, ends the process, copies its file into `quarantine\<id>\` (masked so it cannot run, with a manifest and SHA-256), verifies the copy, then deletes the original. If the original cannot be deleted, the copy is kept and you are told. |
 | **Restore** (Quarantine tab) | Asks first, writes the file back only if nothing exists at the original path, and checks the hash. The entry is kept as `<id>.restored`. |
@@ -75,6 +82,9 @@ When enabled, new findings go to the Application log under source `NtSentry`, ev
 | `src/eventlog.rs` | Opt-in Application event log output |
 | `src/quarantine.rs` | Restorable quarantine |
 | `src/tray.rs` | Notification-area icon and the window icon |
+| `src/explain.rs` | Plain-English help for each kind of finding |
+| `assets/` | Icon (`make_icons.py` regenerates it) and the Windows resource script |
+| `build.rs` | Embeds the icon and version details into `ntsentry.exe` |
 | `src/worker.rs` | Scan thread and live-refresh thread; results reach the UI over `std::sync::mpsc` |
 | `src/app.rs` | The egui dashboard |
 | `src/main.rs` | Entry point and headless CLI |
@@ -138,7 +148,7 @@ Each scan appends one JSON line (`{"unix", "scan", "findings"}`) to `findings.js
 
 ## Build, test, run
 
-Requires the Rust MSVC toolchain and the Visual Studio C++ build tools. `build.ps1` loads the MSVC environment, because Git for Windows ships an unrelated `link.exe`.
+Requires the Rust MSVC toolchain, the Visual Studio C++ build tools and the Windows SDK. `build.ps1` loads the MSVC environment, because Git for Windows ships an unrelated `link.exe`, and puts `rc.exe` on the path so `build.rs` can embed the icon. Without `rc.exe` the build still works, just without an embedded icon.
 
 ```powershell
 .\build.ps1 test      # unit tests + read-only live-system tests

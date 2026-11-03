@@ -21,7 +21,7 @@ use ntsentry::winutil::{format_utc, now_unix, windows_directory};
 use ntsentry::quarantine::{self, QuarantineEntry};
 use ntsentry::worker::{Action, Command, Event, LiveCommand, Worker};
 use ntsentry::persistence_audit::{self, EntryKind};
-use ntsentry::{autostart, dialogs, eventlog, export, module_audit};
+use ntsentry::{autostart, dialogs, eventlog, explain, export, module_audit};
 
 /// Scans that only produce findings: (log kind, finding module).
 const EXTRA_SCANS: [(&str, &str); 3] = [
@@ -58,7 +58,7 @@ impl Tab {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum Selection {
     Finding(String),
     Process(u32),
@@ -69,17 +69,103 @@ enum Selection {
     Quarantined(String),
 }
 
+impl Selection {
+    /// Spec id of the table that shows this kind of row.
+    fn table(&self) -> &'static str {
+        match self {
+            Selection::Finding(_) => "findings",
+            Selection::Process(_) => "processes",
+            Selection::Service(_) => "services",
+            Selection::Driver(_) => "drivers",
+            Selection::Startup(_) => "startup",
+            Selection::Connection(_) => "connections",
+            Selection::Quarantined(_) => "quarantine",
+        }
+    }
+}
+
+/// Operations on the selected rows that need the table's visible rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowsOp {
+    SelectAll,
+    Copy,
+    Export,
+}
+
+/// The keys from `a` to `b` inclusive, in table order.
+fn range_between(keys: &[&Selection], a: &Selection, b: &Selection) -> Option<Vec<Selection>> {
+    let ia = keys.iter().position(|k| *k == a)?;
+    let ib = keys.iter().position(|k| *k == b)?;
+    let (lo, hi) = (ia.min(ib), ia.max(ib));
+    Some(keys[lo..=hi].iter().map(|k| (*k).clone()).collect())
+}
+
+/// Indices of the columns to show: all except hidden ones (never none).
+fn visible_columns(spec: &Spec, hidden: Option<&Vec<String>>) -> Vec<usize> {
+    let cols: Vec<usize> = (0..spec.columns.len())
+        .filter(|&i| hidden.is_none_or(|h| !h.iter().any(|t| t == spec.columns[i].0)))
+        .collect();
+    if cols.is_empty() { (0..spec.columns.len()).collect() } else { cols }
+}
+
+/// Headers and cell texts restricted to the shown columns.
+fn shown_headers<'a>(spec: &'a Spec, cols: &[usize]) -> Vec<&'a str> {
+    cols.iter().map(|&i| spec.columns[i].0).collect()
+}
+
+fn shown_texts<'a>(row: &'a Row, cols: &[usize]) -> Vec<&'a str> {
+    cols.iter().map(|&i| row.cells.get(i).map_or("", |c| c.text.as_str())).collect()
+}
+
+/// Selected rows as tab-separated text with a header line, in table order,
+/// using only the shown columns.
+fn rows_text(spec: &Spec, cols: &[usize], rows: &[&Row], marked: &HashSet<Selection>) -> (String, usize) {
+    let mut text = shown_headers(spec, cols).join("\t");
+    text.push('\n');
+    let mut count = 0;
+    for row in rows.iter().filter(|r| marked.contains(&r.key)) {
+        text.push_str(&shown_texts(row, cols).join("\t"));
+        text.push('\n');
+        count += 1;
+    }
+    (text, count)
+}
+
+/// "Columns" submenu with a checkbox per column.
+fn columns_menu(ui: &mut egui::Ui, spec: &Spec, cols: &[usize]) -> Option<RowAction> {
+    let mut chosen = None;
+    ui.menu_button("Columns", |ui| {
+        for (i, (title, _)) in spec.columns.iter().enumerate() {
+            let mut shown = cols.contains(&i);
+            let last = shown && cols.len() == 1;
+            if ui.add_enabled(!last, egui::Checkbox::new(&mut shown, *title)).clicked() {
+                chosen = Some(RowAction::ToggleColumn(spec.id, title));
+            }
+        }
+        ui.separator();
+        if ui.button("Show all columns").clicked() {
+            chosen = Some(RowAction::ShowAllColumns(spec.id));
+        }
+    });
+    chosen
+}
 /// What a right-click menu item asks for.
 #[derive(Clone, Debug)]
 enum RowAction {
     Details(Selection),
     Copy(Selection),
     OpenLocation(Selection),
-    End(u32),
-    Suspend(u32),
-    Resume(u32),
-    Quarantine(u32),
+    End(Vec<u32>),
+    Suspend(Vec<u32>),
+    Resume(Vec<u32>),
+    Quarantine(Vec<u32>),
     Restore(String),
+    Rows(RowsOp),
+    EndTree(Vec<u32>),
+    VirusTotal(Selection),
+    Properties(Selection),
+    ToggleColumn(&'static str, &'static str),
+    ShowAllColumns(&'static str),
 }
 
 /// A pending action shown in a confirmation dialog.
@@ -87,26 +173,37 @@ struct Confirm {
     title: String,
     text: String,
     button: &'static str,
-    action: Action,
+    actions: Vec<Action>,
 }
 
-/// Right-click menu for a row. `suspended` holds PIDs the dashboard suspended.
-fn row_menu(ui: &mut egui::Ui, selection: &Selection, suspended: &HashSet<u32>) -> Option<RowAction> {
+/// Right-click menu for a row. `targets` are the PIDs a process action applies to
+/// (all selected processes when the row is part of a multi-selection); `suspended`
+/// holds PIDs the dashboard suspended; `selected` is how many rows are selected.
+fn row_menu(
+    ui: &mut egui::Ui,
+    selection: &Selection,
+    targets: &[u32],
+    suspended: &HashSet<u32>,
+    selected: usize,
+) -> Option<RowAction> {
     let mut chosen = None;
-    if let Selection::Process(pid) = selection {
-        let pid = *pid;
-        if ui.button("End process…").clicked() {
-            chosen = Some(RowAction::End(pid));
+    if matches!(selection, Selection::Process(_)) && !targets.is_empty() {
+        let n = targets.len();
+        let label = |text: &str| if n > 1 { format!("{text} ({n} processes)") } else { text.to_string() };
+        if ui.button(label("End process…")).clicked() {
+            chosen = Some(RowAction::End(targets.to_vec()));
         }
-        if suspended.contains(&pid) {
-            if ui.button("Resume").clicked() {
-                chosen = Some(RowAction::Resume(pid));
-            }
-        } else if ui.button("Suspend").clicked() {
-            chosen = Some(RowAction::Suspend(pid));
+        if ui.button(label("End process tree…")).clicked() {
+            chosen = Some(RowAction::EndTree(targets.to_vec()));
         }
-        if ui.button("End and quarantine file…").clicked() {
-            chosen = Some(RowAction::Quarantine(pid));
+        if targets.iter().any(|p| !suspended.contains(p)) && ui.button(label("Suspend")).clicked() {
+            chosen = Some(RowAction::Suspend(targets.to_vec()));
+        }
+        if targets.iter().any(|p| suspended.contains(p)) && ui.button(label("Resume")).clicked() {
+            chosen = Some(RowAction::Resume(targets.to_vec()));
+        }
+        if ui.button(label("End and quarantine file…")).clicked() {
+            chosen = Some(RowAction::Quarantine(targets.to_vec()));
         }
         ui.separator();
     }
@@ -116,14 +213,40 @@ fn row_menu(ui: &mut egui::Ui, selection: &Selection, suspended: &HashSet<u32>) 
         }
         ui.separator();
     }
+    if selected > 1 {
+        if ui.button(format!("Copy {selected} selected rows")).clicked() {
+            chosen = Some(RowAction::Rows(RowsOp::Copy));
+        }
+        if ui.button(format!("Export {selected} selected rows as CSV…")).clicked() {
+            chosen = Some(RowAction::Rows(RowsOp::Export));
+        }
+        ui.separator();
+    }
+    if ui.button("Select all\tCtrl+A").clicked() {
+        chosen = Some(RowAction::Rows(RowsOp::SelectAll));
+    }
     if ui.button("Show details").clicked() {
         chosen = Some(RowAction::Details(selection.clone()));
     }
     if ui.button("Copy details").clicked() {
         chosen = Some(RowAction::Copy(selection.clone()));
     }
-    if !matches!(selection, Selection::Quarantined(_)) && ui.button("Open file location").clicked() {
-        chosen = Some(RowAction::OpenLocation(selection.clone()));
+    let has_file = matches!(selection, Selection::Process(_) | Selection::Service(_) | Selection::Driver(_) | Selection::Startup(_));
+    if has_file {
+        if ui.button("Open file location").clicked() {
+            chosen = Some(RowAction::OpenLocation(selection.clone()));
+        }
+        if ui.button("File properties").clicked() {
+            chosen = Some(RowAction::Properties(selection.clone()));
+        }
+    }
+    if (has_file || matches!(selection, Selection::Quarantined(_)))
+        && ui
+            .button("Look up on VirusTotal")
+            .on_hover_text("Opens your browser with the file's SHA-256. Only the hash leaves this PC.")
+            .clicked()
+    {
+        chosen = Some(RowAction::VirusTotal(selection.clone()));
     }
     chosen
 }
@@ -212,7 +335,8 @@ impl Spec {
 
 #[derive(Default)]
 struct TableOutput {
-    clicked: Option<Selection>,
+    /// Row clicked, the modifiers held, and whether it was a right-click.
+    clicked: Option<(Selection, Modifiers, bool)>,
     sort_clicked: Option<usize>,
     action: Option<RowAction>,
 }
@@ -271,12 +395,15 @@ fn cell_ui(ui: &mut egui::Ui, cell: &Cell) {
 }
 
 /// One sortable, selectable table. Rows are drawn lazily, so thousands are fine.
+#[allow(clippy::too_many_arguments)]
 fn render_table(
     ui: &mut egui::Ui,
     spec: &Spec,
+    cols: &[usize],
     rows: &[&Row],
     sort: (usize, bool),
-    selected: Option<&Selection>,
+    marked: &HashSet<Selection>,
+    scroll_to: Option<usize>,
     menu: &dyn Fn(&mut egui::Ui, &Selection) -> Option<RowAction>,
 ) -> TableOutput {
     let mut out = TableOutput::default();
@@ -287,19 +414,30 @@ fn render_table(
         .sense(egui::Sense::click())
         .auto_shrink(false)
         .max_scroll_height(f32::INFINITY);
-    for (_, column) in &spec.columns {
-        builder = builder.column(*column);
+    if let Some(row) = scroll_to {
+        builder = builder.scroll_to_row(row, None);
+    }
+    for &i in cols {
+        builder = builder.column(spec.columns[i].1);
     }
     builder
         .header(ROW_HEIGHT + 2.0, |mut header| {
-            for (i, (title, _)) in spec.columns.iter().enumerate() {
+            for &i in cols {
+                let title = spec.columns[i].0;
                 header.col(|ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
-                        let button = egui::Button::new(RichText::new(*title).strong()).frame(false);
-                        if ui.add(button).on_hover_text("Click to sort").clicked() {
+                        let button = egui::Button::new(RichText::new(title).strong()).frame(false);
+                        let response = ui.add(button).on_hover_text("Click to sort; right-click to choose columns");
+                        if response.clicked() {
                             out.sort_clicked = Some(i);
                         }
+                        response.context_menu(|ui| {
+                            if let Some(action) = columns_menu(ui, spec, cols) {
+                                out.action = Some(action);
+                                ui.close();
+                            }
+                        });
                         // Arrows exist only in the bundled monospace font.
                         if sort.0 == i {
                             ui.label(RichText::new(if sort.1 { "↑" } else { "↓" }).monospace().strong());
@@ -311,16 +449,23 @@ fn render_table(
         .body(|body| {
             body.rows(ROW_HEIGHT, rows.len(), |mut table_row| {
                 let row = rows[table_row.index()];
-                table_row.set_selected(selected == Some(&row.key));
-                for cell in &row.cells {
-                    table_row.col(|ui| cell_ui(ui, cell));
+                table_row.set_selected(marked.contains(&row.key));
+                for &i in cols {
+                    if let Some(cell) = row.cells.get(i) {
+                        table_row.col(|ui| cell_ui(ui, cell));
+                    }
                 }
                 let response = table_row.response();
                 if response.clicked() || response.secondary_clicked() {
-                    out.clicked = Some(row.key.clone());
+                    let modifiers = response.ctx.input(|i| i.modifiers);
+                    out.clicked = Some((row.key.clone(), modifiers, response.secondary_clicked()));
                 }
                 response.context_menu(|ui| {
-                    if let Some(action) = menu(ui, &row.key) {
+                    let chosen = menu(ui, &row.key).or_else(|| {
+                        ui.separator();
+                        columns_menu(ui, spec, cols)
+                    });
+                    if let Some(action) = chosen {
                         out.action = Some(action);
                         ui.close();
                     }
@@ -393,7 +538,18 @@ pub struct Dashboard {
 
     // View state
     tab: Tab,
+    /// Row whose details are shown (the last one clicked or moved to).
     selected: Option<Selection>,
+    /// All selected rows, for copy, export and bulk actions.
+    marked: HashSet<Selection>,
+    /// Where a Shift range starts.
+    anchor: Option<Selection>,
+    /// Row index to scroll into view in the selection's table this frame.
+    scroll_to: Option<usize>,
+    pending_rows_op: Option<RowsOp>,
+    /// Messages from helper threads (hashing for VirusTotal).
+    notes_tx: std::sync::mpsc::Sender<String>,
+    notes_rx: Receiver<String>,
     filter: String,
     min_severity: Severity,
     flagged_only: bool,
@@ -432,6 +588,15 @@ impl Dashboard {
         let mut sorts = HashMap::new();
         sorts.insert("findings", (0, false));
         sorts.insert("processes", (0, false));
+        for (table, (column, ascending)) in &settings.sorts {
+            if let Some(spec) = Self::spec_for(table)
+                && let Some(i) = spec.columns.iter().position(|(t, _)| t == column)
+            {
+                sorts.insert(spec.id, (i, *ascending));
+            }
+        }
+        let tab = Tab::ALL.into_iter().find(|t| t.label() == settings.last_tab).unwrap_or(Tab::Processes);
+        let (notes_tx, notes_rx) = channel();
         let quarantined = quarantine::list(&data);
         let mut app = Dashboard {
             ctx,
@@ -461,8 +626,14 @@ impl Dashboard {
             new_keys: HashSet::new(),
             alert: None,
             request_attention: false,
-            tab: Tab::Processes,
+            tab,
             selected: None,
+            marked: HashSet::new(),
+            anchor: None,
+            scroll_to: None,
+            pending_rows_op: None,
+            notes_tx,
+            notes_rx,
             filter: String::new(),
             min_severity: Severity::Info,
             flagged_only: false,
@@ -745,8 +916,11 @@ impl Dashboard {
                     ("Memory", Column::initial(80.0)),
                     ("Threads", Column::initial(60.0)),
                     ("Session", Column::initial(60.0)),
+                    ("User", Column::initial(150.0)),
+                    ("Started", Column::initial(150.0)),
                     ("Location", Column::initial(100.0)),
                     ("Signature", Column::initial(240.0)),
+                    ("Command line", Column::initial(320.0)),
                     ("Image path", Column::remainder()),
                 ],
             },
@@ -850,8 +1024,12 @@ impl Dashboard {
             live.map_or_else(Cell::empty, |p| Cell::num(p.thread_count.to_string(), f64::from(p.thread_count))),
             live.filter(|p| p.session_id != u32::MAX)
                 .map_or_else(Cell::empty, |p| Cell::num(p.session_id.to_string(), f64::from(p.session_id))),
+            Cell::text(live.map(|p| p.user.clone()).unwrap_or_default()),
+            live.and_then(|p| ntsentry::system::filetime_to_unix(p.identity.creation_time))
+                .map_or_else(Cell::empty, |t| Cell::num(format_utc(t), t as f64)),
             Cell::text(record.and_then(|r| r.path_class).map_or("", |c| c.label())),
             Cell::text(signature),
+            Cell::text(live.map(|p| p.command_line.clone()).unwrap_or_default()),
             Cell::text(path_shown),
         ];
         Row { key: Selection::Process(pid), cells, system: self.is_system(pid, &path), severity }
@@ -1024,9 +1202,80 @@ impl Dashboard {
         Some((identity, r.name.clone(), r.path.clone().unwrap_or_default(), signature))
     }
 
+    /// Running targets for the PIDs; notes any that are gone.
+    fn process_targets_for(&mut self, pids: &[u32]) -> Vec<(ProcessIdentity, String, String, String)> {
+        let mut targets = Vec::new();
+        for &pid in pids {
+            match self.process_target(pid) {
+                Some(t) => targets.push(t),
+                None => self.note(format!("Process {pid} is no longer in the list; skipped.")),
+            }
+        }
+        targets
+    }
+
+    /// PIDs a process action on `selection` applies to: every selected process
+    /// when the row is part of a multi-selection, else just that one.
+    fn action_pids(&self, selection: &Selection) -> Vec<u32> {
+        let Selection::Process(pid) = selection else { return Vec::new() };
+        let mut marked: Vec<u32> = self
+            .marked
+            .iter()
+            .filter_map(|s| if let Selection::Process(p) = s { Some(*p) } else { None })
+            .collect();
+        if marked.len() > 1 && self.marked.contains(selection) {
+            marked.sort_unstable();
+            marked
+        } else {
+            vec![*pid]
+        }
+    }
+
     fn apply_row_action(&mut self, action: RowAction) {
-        let missing = |app: &mut Self, pid: u32| app.note(format!("Process {pid} is no longer in the list; refresh and try again."));
+        let action_kind = match action {
+            RowAction::Suspend(_) => ActionKind::Suspend,
+            _ => ActionKind::Other,
+        };
         match action {
+            RowAction::Rows(op) => self.pending_rows_op = Some(op),
+            RowAction::ToggleColumn(table, column) => {
+                let hidden = self.settings.hidden_columns.entry(table.to_string()).or_default();
+                match hidden.iter().position(|c| c == column) {
+                    Some(i) => {
+                        hidden.remove(i);
+                    }
+                    None => hidden.push(column.to_string()),
+                }
+            }
+            RowAction::ShowAllColumns(table) => {
+                self.settings.hidden_columns.insert(table.to_string(), Vec::new());
+            }
+            RowAction::Properties(selection) => match self.selection_path(&selection) {
+                Some(path) => {
+                    if let Err(e) = ntsentry::system::open_file_properties(&path) {
+                        self.note(e);
+                    }
+                }
+                None => self.note("The selected item has no file to show properties for."),
+            },
+            RowAction::VirusTotal(selection) => self.virustotal(&selection),
+            RowAction::EndTree(pids) => {
+                let order = self.tree_end_order(&pids);
+                let targets = self.process_targets_for(&order);
+                if targets.is_empty() {
+                    return;
+                }
+                let list = describe_targets(&targets, false);
+                self.confirm = Some(Confirm {
+                    title: format!("End {} process(es) in this tree?", targets.len()),
+                    text: format!(
+                        "{list}\n\nThe selected process and everything it started are stopped immediately, children first. \
+                         Unsaved work in them is lost."
+                    ),
+                    button: "End tree",
+                    actions: targets.into_iter().map(|(identity, name, _, _)| Action::End { identity, name }).collect(),
+                });
+            }
             RowAction::Details(selection) => self.select(selection),
             RowAction::Copy(selection) => {
                 self.select(selection);
@@ -1036,83 +1285,317 @@ impl Dashboard {
                 self.select(selection);
                 self.open_selection_location();
             }
-            RowAction::End(pid) => match self.process_target(pid) {
-                Some((identity, name, path, _)) => {
-                    self.confirm = Some(Confirm {
-                        title: format!("End {name}?"),
-                        text: format!(
-                            "pid {pid}, {}\n\nThe process is stopped immediately. Unsaved work in it is lost.",
-                            if path.is_empty() { "path unavailable" } else { &path }
-                        ),
-                        button: "End process",
-                        action: Action::End { identity, name },
-                    })
+            RowAction::End(pids) => {
+                let targets = self.process_targets_for(&pids);
+                if targets.is_empty() {
+                    return;
                 }
-                None => missing(self, pid),
-            },
-            RowAction::Suspend(pid) | RowAction::Resume(pid) => match self.process_target(pid) {
-                Some((identity, name, _, _)) => {
-                    let act = if matches!(action, RowAction::Suspend(_)) {
-                        Action::Suspend { identity, name }
-                    } else {
-                        Action::Resume { identity, name }
-                    };
+                let list = describe_targets(&targets, false);
+                let title = match targets.as_slice() {
+                    [(_, name, _, _)] => format!("End {name}?"),
+                    _ => format!("End {} processes?", targets.len()),
+                };
+                self.confirm = Some(Confirm {
+                    title,
+                    text: format!("{list}\n\nStopped immediately. Unsaved work in them is lost."),
+                    button: "End",
+                    actions: targets.into_iter().map(|(identity, name, _, _)| Action::End { identity, name }).collect(),
+                });
+            }
+            RowAction::Suspend(pids) | RowAction::Resume(pids) => {
+                let suspend = matches!(action_kind, ActionKind::Suspend);
+                let suspended: HashSet<u32> = ntsentry::system::suspended_processes().iter().map(|i| i.pid).collect();
+                let wanted: Vec<u32> = pids.into_iter().filter(|p| suspended.contains(p) != suspend).collect();
+                for (identity, name, _, _) in self.process_targets_for(&wanted) {
+                    let act = if suspend { Action::Suspend { identity, name } } else { Action::Resume { identity, name } };
                     self.worker.send_live(LiveCommand::Act(act));
                 }
-                None => missing(self, pid),
-            },
-            RowAction::Quarantine(pid) => match self.process_target(pid) {
-                Some((_, name, path, _)) if path.is_empty() => {
-                    self.note(format!("{name} (pid {pid}) has no accessible file path to quarantine."))
-                }
-                Some((identity, name, path, signature)) => {
-                    let windows = windows_directory().unwrap_or_else(|| "C:\\Windows".into());
-                    if let Some(reason) = quarantine::refusal(&path, &windows) {
-                        self.note(reason);
-                        return;
+            }
+            RowAction::Quarantine(pids) => {
+                let windows = windows_directory().unwrap_or_else(|| "C:\\Windows".into());
+                let mut targets = Vec::new();
+                for (identity, name, path, signature) in self.process_targets_for(&pids) {
+                    if path.is_empty() {
+                        self.note(format!("{name} (pid {}) has no accessible file path to quarantine; skipped.", identity.pid));
+                    } else if let Some(reason) = quarantine::refusal(&path, &windows) {
+                        self.note(format!("{name}: {reason}; skipped."));
+                    } else {
+                        targets.push((identity, name, path, signature));
                     }
-                    self.confirm = Some(Confirm {
-                        title: format!("End {name} and quarantine its file?"),
-                        text: format!(
-                            "pid {pid}\n{path}\nSignature: {signature}\n\nThe process is ended, the file is moved into quarantine \
-                             (verified copy, original deleted). You can restore it later from the Quarantine tab."
-                        ),
-                        button: "End and quarantine",
-                        action: Action::Quarantine { identity, name, path, signature },
-                    })
                 }
-                None => missing(self, pid),
-            },
+                if targets.is_empty() {
+                    return;
+                }
+                let list = describe_targets(&targets, true);
+                let title = match targets.as_slice() {
+                    [(_, name, _, _)] => format!("End {name} and quarantine its file?"),
+                    _ => format!("End {} processes and quarantine their files?", targets.len()),
+                };
+                self.confirm = Some(Confirm {
+                    title,
+                    text: format!(
+                        "{list}\n\nEach process is ended and its file moved into quarantine (verified copy, original deleted). \
+                         Restore from the Quarantine tab."
+                    ),
+                    button: "End and quarantine",
+                    actions: targets
+                        .into_iter()
+                        .map(|(identity, name, path, signature)| Action::Quarantine { identity, name, path, signature })
+                        .collect(),
+                });
+            }
             RowAction::Restore(id) => {
                 let path = self.quarantine.iter().find(|q| q.id == id).map(|q| q.original_path.clone()).unwrap_or_default();
                 self.confirm = Some(Confirm {
                     title: "Restore from quarantine?".into(),
                     text: format!("{path}\n\nThe file is written back to its original location. Nothing existing is overwritten."),
                     button: "Restore",
-                    action: Action::Restore { id },
+                    actions: vec![Action::Restore { id }],
                 });
             }
         }
     }
 
-    fn apply_table_output(&mut self, spec_id: &'static str, out: TableOutput) {
+    fn apply_table_output(&mut self, spec_id: &'static str, out: TableOutput, keys: &[&Selection]) {
         if let Some(column) = out.sort_clicked {
             let entry = self.sorts.entry(spec_id).or_insert((column, true));
             *entry = if entry.0 == column { (column, !entry.1) } else { (column, true) };
+            let (column, ascending) = *entry;
+            if let Some(spec) = Self::spec_for(spec_id) {
+                self.settings.sorts.insert(spec_id.to_string(), (spec.columns[column].0.to_string(), ascending));
+            }
+        }
+        if let Some((key, modifiers, secondary)) = out.clicked {
+            self.click_row(key, modifiers, secondary, keys);
         }
         if let Some(action) = out.action {
             self.apply_row_action(action);
         }
-        if let Some(selection) = out.clicked {
-            self.select(selection);
+    }
+
+    /// Click: select one row. Ctrl+click: add or remove a row. Shift+click: select
+    /// the range from the anchor. Right-click keeps a multi-selection that includes
+    /// the row, so its menu acts on all of them.
+    fn click_row(&mut self, key: Selection, modifiers: Modifiers, secondary: bool, keys: &[&Selection]) {
+        let same_table = self.anchor.as_ref().is_some_and(|a| a.table() == key.table());
+        if secondary {
+            if self.marked.contains(&key) {
+                self.focus(key);
+            } else {
+                self.select(key);
+            }
+        } else if modifiers.shift && same_table {
+            let anchor = self.anchor.clone().unwrap();
+            match range_between(keys, &anchor, &key) {
+                Some(range) => {
+                    self.marked = range.into_iter().collect();
+                    self.focus(key);
+                }
+                None => self.select(key),
+            }
+        } else if modifiers.command && same_table {
+            if !self.marked.remove(&key) {
+                self.marked.insert(key.clone());
+            }
+            self.anchor = Some(key.clone());
+            self.focus(key);
+        } else {
+            self.select(key);
         }
     }
 
+    /// Selects exactly this row.
     fn select(&mut self, selection: Selection) {
+        self.marked = HashSet::from([selection.clone()]);
+        self.anchor = Some(selection.clone());
+        self.focus(selection);
+    }
+
+    /// Shows this row's details without changing the multi-selection.
+    fn focus(&mut self, selection: Selection) {
         if let Selection::Process(pid) = &selection {
             self.request_process_details(*pid);
         }
         self.selected = Some(selection);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.marked.clear();
+        self.anchor = None;
+    }
+
+    /// Arrow keys, Home/End, PageUp/PageDown move the selection (Shift extends it),
+    /// Ctrl+A selects every visible row, Ctrl+C copies. Returns a row to scroll to.
+    fn keyboard_selection(&mut self, ui: &mut egui::Ui, rows: &[&Row]) -> Option<usize> {
+        if ui.memory(|m| m.focused().is_some()) || self.confirm.is_some() {
+            return None;
+        }
+        let (step, select_all, shift, copy) = ui.input_mut(|i| {
+            let step = if i.key_pressed(Key::ArrowUp) {
+                Some(-1)
+            } else if i.key_pressed(Key::ArrowDown) {
+                Some(1)
+            } else if i.key_pressed(Key::PageUp) {
+                Some(-20)
+            } else if i.key_pressed(Key::PageDown) {
+                Some(20)
+            } else if i.key_pressed(Key::Home) {
+                Some(isize::MIN)
+            } else if i.key_pressed(Key::End) {
+                Some(isize::MAX)
+            } else {
+                None
+            };
+            let all = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::A));
+            (step, all, i.modifiers.shift, i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+        });
+        if select_all {
+            self.pending_rows_op = Some(RowsOp::SelectAll);
+        }
+        if copy {
+            self.pending_rows_op = Some(RowsOp::Copy);
+        }
+        let step = step?;
+        let keys: Vec<&Selection> = rows.iter().map(|r| &r.key).collect();
+        if keys.is_empty() {
+            return None;
+        }
+        let last = keys.len() - 1;
+        let current = self.selected.as_ref().and_then(|s| keys.iter().position(|k| *k == s));
+        let next = match (current, step) {
+            (_, isize::MIN) => 0,
+            (_, isize::MAX) => last,
+            (None, _) => 0,
+            (Some(c), s) => (c as isize + s).clamp(0, last as isize) as usize,
+        };
+        let key = keys[next].clone();
+        if shift {
+            let anchor = self
+                .anchor
+                .clone()
+                .filter(|a| keys.contains(&a))
+                .unwrap_or_else(|| keys[current.unwrap_or(next)].clone());
+            if let Some(range) = range_between(&keys, &anchor, &key) {
+                self.marked = range.into_iter().collect();
+            }
+            self.anchor = Some(anchor);
+            self.focus(key);
+        } else {
+            self.select(key);
+        }
+        Some(next)
+    }
+
+    /// The PIDs and all their descendants, children before parents. A "parent"
+    /// that started after its child is a reused PID and is not followed.
+    fn tree_end_order(&self, roots: &[u32]) -> Vec<u32> {
+        let Some(live) = &self.live else { return roots.to_vec() };
+        let created: HashMap<u32, u64> = live.processes.iter().map(|p| (p.identity.pid, p.identity.creation_time)).collect();
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for p in &live.processes {
+            let (pid, parent) = (p.identity.pid, p.parent_pid);
+            let genuine = created.get(&parent).is_some_and(|&pc| pc == 0 || p.identity.creation_time == 0 || pc <= p.identity.creation_time);
+            if pid != parent && pid != 0 && genuine {
+                children.entry(parent).or_default().push(pid);
+            }
+        }
+        let mut order = Vec::new();
+        let mut seen = HashSet::new();
+        fn visit(pid: u32, children: &HashMap<u32, Vec<u32>>, seen: &mut HashSet<u32>, order: &mut Vec<u32>) {
+            if !seen.insert(pid) {
+                return;
+            }
+            for &child in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
+                visit(child, children, seen, order);
+            }
+            order.push(pid);
+        }
+        for &root in roots {
+            visit(root, &children, &mut seen, &mut order);
+        }
+        order
+    }
+
+    /// Opens VirusTotal in the browser for the selection's file. The file is hashed
+    /// on a helper thread; only the SHA-256 leaves the PC, inside the URL.
+    fn virustotal(&mut self, selection: &Selection) {
+        let open = |sha256: &str| {
+            std::process::Command::new("explorer.exe")
+                .arg(format!("https://www.virustotal.com/gui/file/{sha256}"))
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("Cannot open the browser: {e}"))
+        };
+        if let Selection::Quarantined(id) = selection {
+            if let Some(q) = self.quarantine.iter().find(|q| &q.id == id) {
+                let sha = q.sha256.clone();
+                match open(&sha) {
+                    Ok(()) => self.note(format!("Opened VirusTotal for {} (SHA-256 {sha})", q.original_path)),
+                    Err(e) => self.note(e),
+                }
+            }
+            return;
+        }
+        let Some(path) = self.selection_path(selection) else {
+            self.note("The selected item has no file to look up.");
+            return;
+        };
+        self.note(format!("Hashing {path} for VirusTotal…"));
+        let tx = self.notes_tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let message = match ntsentry::winutil::sha256_file(&path) {
+                Ok(sha) => match open(&sha) {
+                    Ok(()) => format!("Opened VirusTotal for {path} (SHA-256 {sha})"),
+                    Err(e) => e,
+                },
+                Err(e) => e,
+            };
+            let _ = tx.send(message);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Spec for a table id (findings or an inventory tab).
+    fn spec_for(id: &str) -> Option<Spec> {
+        if id == "findings" {
+            return Some(Self::findings_spec());
+        }
+        Tab::ALL.into_iter().map(Self::tab_spec).find(|s| s.id == id)
+    }
+
+    fn cols_for(&self, spec: &Spec) -> Vec<usize> {
+        visible_columns(spec, self.settings.hidden_columns.get(spec.id))
+    }
+
+    /// Select all / copy / export on the visible rows of the selection's table.
+    fn run_rows_op(&mut self, op: RowsOp, spec: &Spec, rows: &[&Row]) {
+        match op {
+            RowsOp::SelectAll => {
+                self.marked = rows.iter().map(|r| r.key.clone()).collect();
+                self.anchor = rows.first().map(|r| r.key.clone());
+                if self.selected.as_ref().is_none_or(|s| !self.marked.contains(s))
+                    && let Some(first) = rows.first()
+                {
+                    self.focus(first.key.clone());
+                }
+                self.note(format!("Selected all {} rows", rows.len()));
+            }
+            RowsOp::Copy if self.marked.len() > 1 => {
+                let cols = self.cols_for(spec);
+                let (text, count) = rows_text(spec, &cols, rows, &self.marked);
+                self.ctx.copy_text(text);
+                self.note(format!("Copied {count} rows"));
+            }
+            RowsOp::Copy => self.copy_selection(),
+            RowsOp::Export => {
+                let cols = self.cols_for(spec);
+                let selected: Vec<&Row> = rows.iter().copied().filter(|r| self.marked.contains(&r.key)).collect();
+                let csv = export::csv(&shown_headers(spec, &cols), selected.iter().map(|r| shown_texts(r, &cols)));
+                self.save_as("Export selected rows (CSV)", spec.id, ("CSV files", "*.csv"), "csv", csv.into_bytes());
+            }
+        }
     }
 
     fn request_process_details(&mut self, pid: u32) {
@@ -1187,6 +1670,11 @@ impl Dashboard {
                         fields.push(("Session", p.session_id.to_string()));
                     }
                     fields.push(("Critical process", yes_no(p.is_critical)));
+                    fields.push(("User", p.user.clone()));
+                    if let Some(t) = ntsentry::system::filetime_to_unix(p.identity.creation_time) {
+                        fields.push(("Started", format_utc(t)));
+                    }
+                    fields.push(("Command line", p.command_line.clone()));
                 }
                 if let Some(d) = self.proc_details.as_ref().filter(|d| d.pid == *pid) {
                     match &d.file {
@@ -1336,7 +1824,7 @@ impl Dashboard {
             ui.heading(fields.as_ref().map_or("Selection", |(t, _)| t.as_str()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("×").on_hover_text("Close (Esc)").clicked() {
-                    self.selected = None;
+                    self.clear_selection();
                 }
             });
         });
@@ -1348,8 +1836,17 @@ impl Dashboard {
             if ui.button("Copy").on_hover_text("Copy these details (Ctrl+C)").clicked() {
                 self.copy_selection();
             }
-            if self.selection_path(&selection).is_some() && ui.button("Open file location").clicked() {
+            let has_path = self.selection_path(&selection).is_some();
+            if has_path && ui.button("Open file location").clicked() {
                 self.open_selection_location();
+            }
+            if has_path && ui.button("File properties").clicked() {
+                self.apply_row_action(RowAction::Properties(selection.clone()));
+            }
+            if (has_path || matches!(selection, Selection::Quarantined(_)))
+                && ui.button("VirusTotal").on_hover_text("Opens your browser with the file's SHA-256").clicked()
+            {
+                self.apply_row_action(RowAction::VirusTotal(selection.clone()));
             }
             if let Some(pid) = self.selection_pid(&selection)
                 && ui.button(format!("Show process {pid}")).clicked()
@@ -1358,21 +1855,29 @@ impl Dashboard {
                 self.select(Selection::Process(pid));
             }
         });
-        let suspended: HashSet<u32> = ntsentry::system::suspended_processes().iter().map(|i| i.pid).collect();
-        if let Selection::Process(pid) = selection {
+        if self.marked.len() > 1 {
+            ui.label(RichText::new(format!("{} rows selected; right-click one for actions on all of them", self.marked.len())).small().weak());
+        }
+        let pids = self.action_pids(&selection);
+        if !pids.is_empty() {
+            let suspended: HashSet<u32> = ntsentry::system::suspended_processes().iter().map(|i| i.pid).collect();
+            let n = pids.len();
+            let label = |text: &str| if n > 1 { format!("{text} ({n})") } else { text.to_string() };
             ui.horizontal_wrapped(|ui| {
-                if ui.button("End process…").clicked() {
-                    self.apply_row_action(RowAction::End(pid));
+                if ui.button(label("End process…")).clicked() {
+                    self.apply_row_action(RowAction::End(pids.clone()));
                 }
-                if suspended.contains(&pid) {
-                    if ui.button("Resume").clicked() {
-                        self.apply_row_action(RowAction::Resume(pid));
-                    }
-                } else if ui.button("Suspend").clicked() {
-                    self.apply_row_action(RowAction::Suspend(pid));
+                if pids.iter().any(|p| !suspended.contains(p)) && ui.button(label("Suspend")).clicked() {
+                    self.apply_row_action(RowAction::Suspend(pids.clone()));
                 }
-                if ui.button("End and quarantine…").clicked() {
-                    self.apply_row_action(RowAction::Quarantine(pid));
+                if pids.iter().any(|p| suspended.contains(p)) && ui.button(label("Resume")).clicked() {
+                    self.apply_row_action(RowAction::Resume(pids.clone()));
+                }
+                if ui.button(label("End and quarantine…")).clicked() {
+                    self.apply_row_action(RowAction::Quarantine(pids.clone()));
+                }
+                if ui.button(label("End tree…")).on_hover_text("End these and everything they started").clicked() {
+                    self.apply_row_action(RowAction::EndTree(pids.clone()));
                 }
             });
         }
@@ -1383,7 +1888,21 @@ impl Dashboard {
         }
         ui.separator();
         let mut navigate = None;
+        let help = match &selection {
+            Selection::Finding(key) => self.all_findings().into_iter().find(|f| &f.row_key() == key).map(explain::explain),
+            _ => None,
+        };
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            if let Some(help) = &help {
+                egui::Frame::new().fill(ui.visuals().faint_bg_color).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
+                    ui.strong("What this means");
+                    ui.add(egui::Label::new(help.meaning).wrap());
+                    ui.add_space(4.0);
+                    ui.strong("What you can do");
+                    ui.add(egui::Label::new(help.next_steps).wrap());
+                });
+                ui.add_space(6.0);
+            }
             for (label, value) in fields.iter().filter(|(_, v)| !v.is_empty()) {
                 ui.label(RichText::new(*label).small().weak());
                 let mono = label.contains("bytes") || label.contains("RVA");
@@ -1488,7 +2007,8 @@ impl Dashboard {
         let spec = Self::tab_spec(self.tab);
         let rows = self.tab_rows(self.tab);
         let visible = self.visible(spec.id, &rows, Some(self.tab));
-        let csv = export::csv(&spec.headers(), visible.iter().map(|r| r.texts()));
+        let cols = self.cols_for(&spec);
+        let csv = export::csv(&shown_headers(&spec, &cols), visible.iter().map(|r| shown_texts(r, &cols)));
         self.save_as(&format!("Export {} (CSV)", self.tab.label()), spec.id, ("CSV files", "*.csv"), "csv", csv.into_bytes());
     }
 
@@ -1566,8 +2086,8 @@ impl Dashboard {
             });
             ui.menu_button("Edit", |ui| {
                 let has = self.selected.is_some();
-                if ui.add_enabled(has, egui::Button::new("Copy selected details\tCtrl+C")).clicked() {
-                    self.copy_selection();
+                if ui.add_enabled(has, egui::Button::new("Copy\tCtrl+C")).clicked() {
+                    self.pending_rows_op = Some(RowsOp::Copy);
                     ui.close();
                 }
                 let path = self.selected.as_ref().and_then(|s| self.selection_path(s));
@@ -1575,28 +2095,45 @@ impl Dashboard {
                     self.open_selection_location();
                     ui.close();
                 }
-                if let Some(Selection::Process(pid)) = self.selected.clone() {
-                    ui.separator();
-                    if ui.button("End process…").clicked() {
-                        self.apply_row_action(RowAction::End(pid));
-                        ui.close();
-                    }
-                    if ui.button("Suspend").clicked() {
-                        self.apply_row_action(RowAction::Suspend(pid));
-                        ui.close();
-                    }
-                    if ui.button("Resume").clicked() {
-                        self.apply_row_action(RowAction::Resume(pid));
-                        ui.close();
-                    }
-                    if ui.button("End and quarantine…").clicked() {
-                        self.apply_row_action(RowAction::Quarantine(pid));
-                        ui.close();
-                    }
-                    ui.separator();
+                ui.separator();
+                if ui.button("Select all\tCtrl+A").clicked() {
+                    self.pending_rows_op = Some(RowsOp::SelectAll);
+                    ui.close();
                 }
+                let count = self.marked.len();
+                if ui.add_enabled(count > 1, egui::Button::new(format!("Copy {count} selected rows"))).clicked() {
+                    self.pending_rows_op = Some(RowsOp::Copy);
+                    ui.close();
+                }
+                if ui.add_enabled(count > 0, egui::Button::new("Export selected rows as CSV…")).clicked() {
+                    self.pending_rows_op = Some(RowsOp::Export);
+                    ui.close();
+                }
+                let pids = self.selected.as_ref().map(|s| self.action_pids(s)).unwrap_or_default();
+                if !pids.is_empty() {
+                    ui.separator();
+                    let n = pids.len();
+                    let label = |text: &str| if n > 1 { format!("{text} ({n} processes)") } else { text.to_string() };
+                    if ui.button(label("End process…")).clicked() {
+                        self.apply_row_action(RowAction::End(pids.clone()));
+                        ui.close();
+                    }
+                    if ui.button(label("Suspend")).clicked() {
+                        self.apply_row_action(RowAction::Suspend(pids.clone()));
+                        ui.close();
+                    }
+                    if ui.button(label("Resume")).clicked() {
+                        self.apply_row_action(RowAction::Resume(pids.clone()));
+                        ui.close();
+                    }
+                    if ui.button(label("End and quarantine…")).clicked() {
+                        self.apply_row_action(RowAction::Quarantine(pids.clone()));
+                        ui.close();
+                    }
+                }
+                ui.separator();
                 if ui.add_enabled(has, egui::Button::new("Clear selection\tEsc")).clicked() {
-                    self.selected = None;
+                    self.clear_selection();
                     ui.close();
                 }
             });
@@ -1807,8 +2344,8 @@ impl Dashboard {
             if ui.add_enabled(path.is_some(), egui::Button::new("Open folder")).clicked() {
                 self.open_selection_location();
             }
-            if ui.add_enabled(self.selected.is_some(), egui::Button::new("Copy")).clicked() {
-                self.copy_selection();
+            if ui.add_enabled(self.selected.is_some(), egui::Button::new("Copy")).on_hover_text("Ctrl+C: selected rows, or the details of one").clicked() {
+                self.pending_rows_op = Some(RowsOp::Copy);
             }
             ui.menu_button("Export…", |ui| {
                 if ui.button(format!("{} view as CSV…", self.tab.label())).clicked() {
@@ -1850,7 +2387,11 @@ impl Dashboard {
                 }
             }
             ui.separator();
-            ui.label(format!("{shown} entries shown"));
+            if self.marked.len() > 1 {
+                ui.label(format!("{shown} entries shown · {} selected", self.marked.len()));
+            } else {
+                ui.label(format!("{shown} entries shown"));
+            }
             ui.separator();
             ui.label(if self.settings.live_refresh {
                 format!("Live refresh every {} s", self.settings.live_refresh_seconds)
@@ -1941,7 +2482,9 @@ impl Dashboard {
             match decision {
                 Some(true) => {
                     let confirm = self.confirm.take().unwrap();
-                    self.worker.send_live(LiveCommand::Act(confirm.action));
+                    for action in confirm.actions {
+                        self.worker.send_live(LiveCommand::Act(action));
+                    }
                 }
                 Some(false) => self.confirm = None,
                 None => {}
@@ -1968,7 +2511,7 @@ impl Dashboard {
         }
         egui::Window::new("About NtSentry").open(&mut self.show_about).collapsible(false).show(ctx, |ui| {
             ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-            ui.label("Read-only tamper detection and system inventory for Windows.");
+            ui.label("Tamper detection, system inventory and confirmed process actions for Windows.");
             ui.label("Scans never write to process memory, change protections, or restore bytes.");
             ui.label("Process actions (end, suspend, quarantine) run only after you confirm them, and are logged.");
             ui.label(format!("Data folder: {}", self.data.root.display()));
@@ -1976,7 +2519,10 @@ impl Dashboard {
         egui::Window::new("How to use").open(&mut self.show_help).default_width(520.0).show(ctx, |ui| {
             ui.label("• Findings (top) lists everything the scans found, most severe first. NEW marks findings that were not in the previous scan.");
             ui.label("• The tabs below show every process, service, driver, startup entry and network endpoint. Click a column header to sort.");
-            ui.label("• Click any row to see its full details on the right; Ctrl+C copies them, Esc closes.");
+            ui.label("• Click any row to see its full details on the right; Esc clears the selection.");
+            ui.label("• Select several rows: Ctrl+click, Shift+click, Shift+arrow keys, or Ctrl+A for all. Ctrl+C copies them; right-click for actions on all of them.");
+            ui.label("• Right-click a row or a column header > Columns to show or hide columns. Copies and exports include only the shown columns.");
+            ui.label("• Click a finding to read what it means and what you can do about it.");
             ui.label("• Right-click a process to end, suspend/resume, or end it and quarantine its file. Restore from the Quarantine tab.");
             ui.label("• Find (Ctrl+F) filters the findings and the current tab by any text: name, PID, path…");
             ui.label("• Baseline > Capture baseline records ntdll on a known-clean system; later scans report only deviations from it.");
@@ -1988,12 +2534,11 @@ impl Dashboard {
     }
 
     fn handle_shortcuts(&mut self, ui: &mut egui::Ui) {
-        let (f5, find, save, copy, escape) = ui.input_mut(|i| {
+        let (f5, find, save, escape) = ui.input_mut(|i| {
             (
                 i.key_pressed(Key::F5),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::F)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S)),
-                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
                 i.key_pressed(Key::Escape),
             )
         });
@@ -2007,13 +2552,35 @@ impl Dashboard {
         if save {
             self.export_current_view();
         }
-        if copy && !typing {
-            self.copy_selection();
-        }
         if escape && !typing {
-            self.selected = None;
+            self.clear_selection();
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ActionKind {
+    Suspend,
+    Other,
+}
+
+/// "name (pid N)" lines for a confirmation, at most 15, optionally with paths.
+fn describe_targets(targets: &[(ProcessIdentity, String, String, String)], paths: bool) -> String {
+    let mut lines: Vec<String> = targets
+        .iter()
+        .take(15)
+        .map(|(identity, name, path, signature)| {
+            if paths {
+                format!("{name} (pid {})\n    {path}\n    {signature}", identity.pid)
+            } else {
+                format!("{name} (pid {})", identity.pid)
+            }
+        })
+        .collect();
+    if targets.len() > 15 {
+        lines.push(format!("…and {} more", targets.len() - 15));
+    }
+    lines.join("\n")
 }
 
 fn yes_no(value: bool) -> String {
@@ -2084,6 +2651,12 @@ impl eframe::App for Dashboard {
         }
         self.drain_events();
         self.poll_save();
+        while let Ok(message) = self.notes_rx.try_recv() {
+            self.note(message);
+        }
+        if self.settings.last_tab != self.tab.label() {
+            self.settings.last_tab = self.tab.label().to_string();
+        }
         if std::mem::take(&mut self.request_attention) && !self.hidden {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
         }
@@ -2171,6 +2744,24 @@ impl eframe::App for Dashboard {
         let visible_tab = self.visible(tab_spec.id, &tab_rows, Some(self.tab));
         let shown = visible_tab.len();
 
+        // Keyboard selection and row operations act on the table holding the selection.
+        let active = self.anchor.as_ref().map_or(tab_spec.id, |a| a.table());
+        let (active_spec, active_rows) = if active == findings_spec.id {
+            (&findings_spec, &visible_findings)
+        } else {
+            (&tab_spec, &visible_tab)
+        };
+        self.scroll_to = self.keyboard_selection(ui, active_rows);
+        if let Some(op) = self.pending_rows_op.take() {
+            self.run_rows_op(op, active_spec, active_rows);
+        }
+        let scroll_findings = self.scroll_to.filter(|_| active == findings_spec.id);
+        let scroll_tab = self.scroll_to.filter(|_| active != findings_spec.id);
+        let findings_cols = self.cols_for(&findings_spec);
+        let tab_cols = self.cols_for(&tab_spec);
+        let findings_keys: Vec<&Selection> = visible_findings.iter().map(|r| &r.key).collect();
+        let tab_keys: Vec<&Selection> = visible_tab.iter().map(|r| &r.key).collect();
+
         egui::Panel::top("menu_bar").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, shown));
@@ -2190,7 +2781,19 @@ impl eframe::App for Dashboard {
 
         let mut outputs = Vec::new();
         let suspended: HashSet<u32> = ntsentry::system::suspended_processes().iter().map(|i| i.pid).collect();
-        let menu = |ui: &mut egui::Ui, selection: &Selection| row_menu(ui, selection, &suspended);
+        let marked = self.marked.clone();
+        let mut marked_pids: Vec<u32> =
+            marked.iter().filter_map(|s| if let Selection::Process(p) = s { Some(*p) } else { None }).collect();
+        marked_pids.sort_unstable();
+        let menu = |ui: &mut egui::Ui, selection: &Selection| {
+            let targets = match selection {
+                Selection::Process(_) if marked_pids.len() > 1 && marked.contains(selection) => marked_pids.clone(),
+                Selection::Process(pid) => vec![*pid],
+                _ => Vec::new(),
+            };
+            let selected = if marked.contains(selection) { marked.len() } else { 1 };
+            row_menu(ui, selection, &targets, &suspended, selected)
+        };
         egui::CentralPanel::default().show(ui, |ui| {
             self.summary(ui);
             if let Some(alert) = self.alert.clone() {
@@ -2232,7 +2835,7 @@ impl eframe::App for Dashboard {
             egui::Panel::top("findings_pane").resizable(true).default_size(findings_height).min_size(70.0).show(ui, |ui| {
                 ui.strong(format!("Findings ({} shown)", visible_findings.len()));
                 let sort = self.sorts.get(findings_spec.id).copied().unwrap_or((0, false));
-                outputs.push((findings_spec.id, render_table(ui, &findings_spec, &visible_findings, sort, self.selected.as_ref(), &menu)));
+                outputs.push((findings_spec.id, render_table(ui, &findings_spec, &findings_cols, &visible_findings, sort, &marked, scroll_findings, &menu)));
             });
             ui.horizontal(|ui| {
                 for tab in Tab::ALL {
@@ -2247,12 +2850,11 @@ impl eframe::App for Dashboard {
                 }
             });
             let sort = self.sorts.get(tab_spec.id).copied().unwrap_or((0, true));
-            outputs.push((tab_spec.id, render_table(ui, &tab_spec, &visible_tab, sort, self.selected.as_ref(), &menu)));
+            outputs.push((tab_spec.id, render_table(ui, &tab_spec, &tab_cols, &visible_tab, sort, &marked, scroll_tab, &menu)));
         });
-        drop(visible_findings);
-        drop(visible_tab);
         for (id, out) in outputs {
-            self.apply_table_output(id, out);
+            let keys = if id == findings_spec.id { &findings_keys } else { &tab_keys };
+            self.apply_table_output(id, out, keys);
         }
     }
 }
@@ -2286,8 +2888,9 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input, |ui| {
-                let out = render_table(ui, spec, &refs, (0, true), None, &menu);
-                selected.extend(out.clicked);
+                let cols: Vec<usize> = (0..spec.columns.len()).collect();
+                let out = render_table(ui, spec, &cols, &refs, (0, true), &HashSet::new(), None, &menu);
+                selected.extend(out.clicked.map(|c| c.0));
                 sorted.extend(out.sort_clicked);
             });
             // No renderer in tests: drop the font texture uploads explicitly.
@@ -2351,6 +2954,27 @@ mod tests {
         let (selected, sorted, _) = run_frames(&rows, &spec, &[pos2(140.0, 8.0)], egui::PointerButton::Primary);
         assert!(selected.is_empty());
         assert_eq!(sorted, vec![1]);
+    }
+
+    #[test]
+    fn ranges_and_copied_rows_follow_table_order() {
+        let (rows, _) = sample();
+        let keys: Vec<&Selection> = rows.iter().map(|r| &r.key).collect();
+        let range = range_between(&keys, &Selection::Process(4), &Selection::Process(2)).unwrap();
+        assert_eq!(range, vec![Selection::Process(2), Selection::Process(3), Selection::Process(4)]);
+        assert!(range_between(&keys, &Selection::Process(9), &Selection::Process(2)).is_none());
+        let refs: Vec<&Row> = rows.iter().collect();
+        let marked: HashSet<Selection> = [Selection::Process(4), Selection::Process(1)].into_iter().collect();
+        let spec = Spec { id: "test", columns: vec![("PID", Column::auto()), ("Name", Column::auto())] };
+        let (text, count) = rows_text(&spec, &[0, 1], &refs, &marked);
+        assert_eq!(count, 2);
+        assert_eq!(text, "PID\tName\n1\tprocess-1.exe\n4\tprocess-4.exe\n");
+        let (text, _) = rows_text(&spec, &[1], &refs, &marked);
+        assert_eq!(text, "Name\nprocess-1.exe\nprocess-4.exe\n", "hidden columns are left out");
+        let hidden = vec!["PID".to_string()];
+        assert_eq!(visible_columns(&spec, Some(&hidden)), vec![1]);
+        let all = vec!["PID".to_string(), "Name".to_string()];
+        assert_eq!(visible_columns(&spec, Some(&all)), vec![0, 1], "never hide every column");
     }
 
     #[test]

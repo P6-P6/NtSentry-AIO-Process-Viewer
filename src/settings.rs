@@ -4,6 +4,7 @@
 use crate::findings::Severity;
 use crate::storage::DataDir;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -35,6 +36,12 @@ pub struct Settings {
     pub show_activity: bool,
     pub light_theme: bool,
     pub zoom: f32,
+    /// Hidden column titles per table id.
+    pub hidden_columns: BTreeMap<String, Vec<String>>,
+    /// Sort column title and direction (true = ascending) per table id.
+    pub sorts: BTreeMap<String, (String, bool)>,
+    /// Inventory tab shown last.
+    pub last_tab: String,
 }
 
 impl Default for Settings {
@@ -57,6 +64,9 @@ impl Default for Settings {
             show_activity: true,
             light_theme: false,
             zoom: 1.0,
+            hidden_columns: BTreeMap::from([("processes".to_string(), vec!["Command line".to_string()])]),
+            sorts: BTreeMap::new(),
+            last_tab: "Processes".into(),
         }
     }
 }

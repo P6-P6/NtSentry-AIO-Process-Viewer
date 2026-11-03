@@ -12,6 +12,7 @@ compile_error!("ntsentry inspects Windows images and processes; build it for a W
 pub mod autostart;
 pub mod dialogs;
 pub mod eventlog;
+pub mod explain;
 pub mod export;
 pub mod findings;
 pub mod integrity_monitor;
