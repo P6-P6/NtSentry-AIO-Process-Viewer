@@ -384,6 +384,14 @@ fn compare_keys(a: &SortKey, b: &SortKey, ascending: bool) -> Ordering {
     if ascending { ordered } else { ordered.reverse() }
 }
 
+/// Stable sort by one column, so ties keep their current order.
+fn sort_by_column<T>(items: &mut [T], row: impl Fn(&T) -> &Row, (column, ascending): (usize, bool)) {
+    items.sort_by(|a, b| match (row(a).cells.get(column), row(b).cells.get(column)) {
+        (Some(x), Some(y)) => compare_keys(&x.sort, &y.sort, ascending),
+        _ => Ordering::Equal,
+    });
+}
+
 fn cell_ui(ui: &mut egui::Ui, cell: &Cell) {
     let mut rich = RichText::new(&cell.text);
     if cell.mono {
@@ -1064,7 +1072,14 @@ impl Dashboard {
                     (None, None) => Vec::new(),
                 };
                 entries.sort_by(|a, b| a.0.cells[2].text.to_lowercase().cmp(&b.0.cells[2].text.to_lowercase()));
-                if self.settings.process_tree { tree_order(entries) } else { entries.into_iter().map(|e| e.0).collect() }
+                if !self.settings.process_tree {
+                    return entries.into_iter().map(|e| e.0).collect();
+                }
+                // The tree keeps sibling order, so sorting first orders each parent's children.
+                if let Some(&sort) = self.sorts.get("processes") {
+                    sort_by_column(&mut entries, |e| &e.0, sort);
+                }
+                tree_order(entries)
             }
             Tab::Services | Tab::Drivers => {
                 let Some(inv) = &self.inventory else { return Vec::new() };
@@ -1171,7 +1186,7 @@ impl Dashboard {
         }
     }
 
-    /// Applies Find text and the system/flagged filters, then sorts (except in tree view).
+    /// Applies Find text and the system/flagged filters, then sorts (tree view arrives sorted).
     fn visible<'a>(&self, spec_id: &'static str, rows: &'a [Row], tab: Option<Tab>) -> Vec<&'a Row> {
         let needle = self.filter.trim().to_lowercase();
         let processes = tab == Some(Tab::Processes);
@@ -1185,11 +1200,8 @@ impl Dashboard {
         if processes && self.settings.process_tree {
             return visible;
         }
-        if let Some(&(column, ascending)) = self.sorts.get(spec_id) {
-            visible.sort_by(|a, b| match (a.cells.get(column), b.cells.get(column)) {
-                (Some(x), Some(y)) => compare_keys(&x.sort, &y.sort, ascending),
-                _ => Ordering::Equal,
-            });
+        if let Some(&sort) = self.sorts.get(spec_id) {
+            sort_by_column(&mut visible, |r| *r, sort);
         }
         visible
     }
@@ -1364,10 +1376,15 @@ impl Dashboard {
 
     fn apply_table_output(&mut self, spec_id: &'static str, out: TableOutput, keys: &[&Selection]) {
         if let Some(column) = out.sort_clicked {
-            let entry = self.sorts.entry(spec_id).or_insert((column, true));
-            *entry = if entry.0 == column { (column, !entry.1) } else { (column, true) };
-            let (column, ascending) = *entry;
-            if let Some(spec) = Self::spec_for(spec_id) {
+            let spec = Self::spec_for(spec_id);
+            // Usage columns start with the largest value, like Task Manager.
+            let largest_first = spec.as_ref().is_some_and(|s| matches!(s.columns[column].0, "CPU %" | "Memory" | "Threads" | "Size"));
+            let ascending = match self.sorts.get(spec_id) {
+                Some(&(current, ascending)) if current == column => !ascending,
+                _ => !largest_first,
+            };
+            self.sorts.insert(spec_id, (column, ascending));
+            if let Some(spec) = spec {
                 self.settings.sorts.insert(spec_id.to_string(), (spec.columns[column].0.to_string(), ascending));
             }
         }
@@ -2562,7 +2579,7 @@ impl Dashboard {
             ui.label("• Baseline > Capture baseline records ntdll on a known-clean system; later scans report only deviations from it.");
             ui.label("• Scan > ... also compares ntdll across all processes, checks loaded DLLs, and audits services, drivers and startup entries.");
             ui.label("• Settings: run at sign-in, scheduled scans (logged to findings.jsonl), live refresh, alerts, event log, tray.");
-            ui.label("• View > Process tree shows parent/child relationships (sorting is off in tree view).");
+            ui.label("• View > Process tree shows parent/child relationships (sorting orders each parent's children).");
             ui.label("• File: export the current view, findings, or a full report.");
         });
     }
@@ -3031,6 +3048,20 @@ mod tests {
         assert!(matches!(keys[0], SortKey::Text(_)));
         assert!(matches!(keys[1], SortKey::Num(x) if x == 10.0));
         assert!(matches!(keys[3], SortKey::Empty));
+    }
+
+    #[test]
+    fn tree_view_sorts_children_within_their_parent() {
+        // (pid, parent, CPU %): 1 has children 3 and 4; 2 is a separate root.
+        let entries = [(1, 0, 0.0), (2, 0, 9.0), (3, 1, 1.0), (4, 1, 5.0)].map(|(pid, parent, cpu)| {
+            let cells = vec![Cell::empty(), Cell::num(pid.to_string(), f64::from(pid)), Cell::text(format!("p{pid}.exe")), Cell::num(format!("{cpu:.1}"), cpu)];
+            (Row::new(Selection::Process(pid), cells), parent, 0)
+        });
+        let mut entries = entries.into_iter().collect::<Vec<_>>();
+        sort_by_column(&mut entries, |e| &e.0, (3, false));
+        let order: Vec<Selection> = tree_order(entries).into_iter().map(|r| r.key).collect();
+        let pids = [2, 1, 4, 3].map(Selection::Process);
+        assert_eq!(order, pids);
     }
 
     #[test]

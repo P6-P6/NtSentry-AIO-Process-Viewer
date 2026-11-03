@@ -131,12 +131,15 @@ fn expected_system_location(name: &str, dirs: &KnownDirs) -> Option<Vec<String>>
     const SYSTEM32: &[&str] = &[
         "csrss.exe", "smss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "lsaiso.exe",
         "svchost.exe", "spoolsv.exe", "taskhostw.exe", "dllhost.exe", "conhost.exe", "sihost.exe",
-        "fontdrvhost.exe", "dwm.exe", "ctfmon.exe", "runtimebroker.exe", "wmiprvse.exe", "searchindexer.exe",
+        "fontdrvhost.exe", "dwm.exe", "ctfmon.exe", "runtimebroker.exe", "searchindexer.exe",
         "rundll32.exe", "regsvr32.exe", "userinit.exe", "taskmgr.exe", "audiodg.exe", "werfault.exe",
     ];
     let lower = name.to_lowercase();
     if lower == "explorer.exe" {
         return Some(vec![format!("{}explorer.exe", dirs.windows), format!("{}explorer.exe", dirs.syswow64)]);
+    }
+    if lower == "wmiprvse.exe" {
+        return Some(vec![format!("{}wbem\\wmiprvse.exe", dirs.system32), format!("{}wbem\\wmiprvse.exe", dirs.syswow64)]);
     }
     SYSTEM32
         .contains(&lower.as_str())
@@ -489,6 +492,10 @@ mod tests {
         assert!(f.is_empty(), "{f:?}");
         let (_, f) = assess(901, "explorer.exe", "C:\\Windows\\explorer.exe", Some(&sig(SignatureState::Valid)), &dirs());
         assert!(f.is_empty(), "{f:?}");
+        let (_, f) = assess(902, "WmiPrvSE.exe", "C:\\Windows\\System32\\wbem\\WmiPrvSE.exe", Some(&sig(SignatureState::Valid)), &dirs());
+        assert!(f.is_empty(), "{f:?}");
+        let (_, f) = assess(903, "WmiPrvSE.exe", "C:\\Windows\\System32\\WmiPrvSE.exe", Some(&sig(SignatureState::Valid)), &dirs());
+        assert!(f.iter().any(|x| x.title.contains("unexpected location")), "{f:?}");
     }
 
     #[test]
