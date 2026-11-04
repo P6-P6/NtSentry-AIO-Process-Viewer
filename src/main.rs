@@ -1,11 +1,13 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod theme;
 mod tray;
 
 use eframe::egui;
 use ntsentry::autostart::MINIMIZED_FLAG;
 use ntsentry::process_inventory::{self, KnownDirs, ProcessInventory};
+use ntsentry::settings::{Settings, WindowPlacement};
 use ntsentry::signature::SignatureCache;
 use ntsentry::storage::{DataDir, write_new};
 use ntsentry::{integrity_monitor, inventory, module_audit, persistence_audit};
@@ -37,12 +39,23 @@ fn main() {
         }
         return;
     }
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("NtSentry AIO Process Viewer")
+        .with_inner_size([1400.0, 880.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_icon(std::sync::Arc::new(tray::window_icon()));
+    // The window placement is ours, not eframe's: eframe also saves it while the
+    // window is minimized to the tray, which reopened the window tiny. eframe
+    // restores any window it finds in its state file even with persist_window
+    // off, so its state (pane sizes, column widths) lives in a file of ours that
+    // never holds one.
+    if let Some(w) = Settings::load(&data).0.window.filter(on_a_monitor) {
+        viewport = viewport.with_position([w.x, w.y]).with_inner_size([w.width, w.height]).with_maximized(w.maximized);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("NtSentry AIO Process Viewer")
-            .with_inner_size([1400.0, 880.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_icon(std::sync::Arc::new(tray::window_icon())),
+        viewport,
+        persist_window: false,
+        persistence_path: Some(data.root.join("ui-state.ron")),
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
@@ -53,6 +66,14 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     }
+}
+
+/// Whether the top of a saved window is on a connected monitor.
+fn on_a_monitor(w: &WindowPlacement) -> bool {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
+    let top_middle = POINT { x: (w.x + w.width / 2.0) as i32, y: (w.y + 10.0) as i32 };
+    !unsafe { MonitorFromPoint(top_middle, MONITOR_DEFAULTTONULL) }.is_null()
 }
 
 fn cli(args: &[String], data: &DataDir) -> Result<(), String> {

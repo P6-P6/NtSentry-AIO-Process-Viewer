@@ -4,6 +4,7 @@
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_extras::{Column, TableBuilder};
+use crate::theme;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use ntsentry::inventory::{
     ProcessDetails, ProcessIdentity, ProcessInfo, ProcessSnapshot, SystemInventory, image_path_from_command,
 };
 use ntsentry::process_inventory::{self, ProcessRecord, ProcessReport};
-use ntsentry::settings::Settings;
+use ntsentry::settings::{Settings, Theme, WindowPlacement};
 use ntsentry::storage::DataDir;
 use ntsentry::winutil::{format_utc, now_unix, windows_directory};
 use ntsentry::quarantine::{self, QuarantineEntry};
@@ -346,6 +347,15 @@ struct TableOutput {
 }
 
 fn severity_color(s: Severity) -> Color32 {
+    if theme::is_light() {
+        return match s {
+            Severity::Critical => Color32::from_rgb(179, 38, 30),
+            Severity::High => Color32::from_rgb(178, 74, 0),
+            Severity::Medium => Color32::from_rgb(133, 90, 0),
+            Severity::Low => Color32::from_rgb(63, 106, 18),
+            Severity::Info => Color32::from_gray(100),
+        };
+    }
     match s {
         Severity::Critical => Color32::from_rgb(230, 60, 60),
         Severity::High => Color32::from_rgb(240, 120, 40),
@@ -419,68 +429,72 @@ fn render_table(
     menu: &dyn Fn(&mut egui::Ui, &Row) -> Option<RowAction>,
 ) -> TableOutput {
     let mut out = TableOutput::default();
-    let mut builder = TableBuilder::new(ui)
-        .id_salt(spec.id)
-        .striped(true)
-        .resizable(true)
-        .sense(egui::Sense::click())
-        .auto_shrink(false)
-        .max_scroll_height(f32::INFINITY);
-    if let Some(row) = scroll_to {
-        builder = builder.scroll_to_row(row, None);
-    }
-    for &i in cols {
-        builder = builder.column(spec.columns[i].1);
-    }
-    builder
-        .header(ROW_HEIGHT + 2.0, |mut header| {
-            for &i in cols {
-                let title = spec.columns[i].0;
-                let (_, response) = header.col(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        ui.add(egui::Label::new(RichText::new(title).strong()).selectable(false));
-                        // Arrows exist only in the bundled monospace font.
-                        if sort.0 == i {
-                            ui.add(egui::Label::new(RichText::new(if sort.1 { "↑" } else { "↓" }).monospace().strong()).selectable(false));
+    theme::well(ui, |ui| {
+        let mut builder = TableBuilder::new(ui)
+            .id_salt(spec.id)
+            .striped(true)
+            .resizable(true)
+            .sense(egui::Sense::click())
+            .auto_shrink(false)
+            .max_scroll_height(f32::INFINITY);
+        if let Some(row) = scroll_to {
+            builder = builder.scroll_to_row(row, None);
+        }
+        for &i in cols {
+            builder = builder.column(spec.columns[i].1);
+        }
+        builder
+            .header(ROW_HEIGHT + 2.0, |mut header| {
+                for &i in cols {
+                    let title = spec.columns[i].0;
+                    let (_, response) = header.col(|ui| {
+                        theme::header_cell(ui);
+                        let font = theme::header_font(ui);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            ui.add(egui::Label::new(RichText::new(title).font(font).strong()).selectable(false));
+                            // Arrows exist only in the bundled monospace font.
+                            if sort.0 == i {
+                                ui.add(egui::Label::new(RichText::new(if sort.1 { "↑" } else { "↓" }).monospace().strong()).selectable(false));
+                            }
+                        });
+                    });
+                    // The whole header cell sorts on click and offers the column chooser on right-click.
+                    let response = response.on_hover_text("Click to sort; right-click to choose columns");
+                    if response.clicked() {
+                        out.sort_clicked = Some(i);
+                    }
+                    response.context_menu(|ui| {
+                        if let Some(action) = columns_menu(ui, spec, cols) {
+                            out.action = Some(action);
+                            ui.close();
+                        }
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, rows.len(), |mut table_row| {
+                    let row = rows[table_row.index()];
+                    table_row.set_selected(marked.contains(&row.key));
+                    for &i in cols {
+                        if let Some(cell) = row.cells.get(i) {
+                            table_row.col(|ui| cell_ui(ui, cell));
+                        }
+                    }
+                    let response = table_row.response();
+                    if response.clicked() || response.secondary_clicked() {
+                        let modifiers = response.ctx.input(|i| i.modifiers);
+                        out.clicked = Some((row.key.clone(), modifiers, response.secondary_clicked()));
+                    }
+                    response.context_menu(|ui| {
+                        if let Some(action) = menu(ui, row) {
+                            out.action = Some(action);
+                            ui.close();
                         }
                     });
                 });
-                // The whole header cell sorts on click and offers the column chooser on right-click.
-                let response = response.on_hover_text("Click to sort; right-click to choose columns");
-                if response.clicked() {
-                    out.sort_clicked = Some(i);
-                }
-                response.context_menu(|ui| {
-                    if let Some(action) = columns_menu(ui, spec, cols) {
-                        out.action = Some(action);
-                        ui.close();
-                    }
-                });
-            }
-        })
-        .body(|body| {
-            body.rows(ROW_HEIGHT, rows.len(), |mut table_row| {
-                let row = rows[table_row.index()];
-                table_row.set_selected(marked.contains(&row.key));
-                for &i in cols {
-                    if let Some(cell) = row.cells.get(i) {
-                        table_row.col(|ui| cell_ui(ui, cell));
-                    }
-                }
-                let response = table_row.response();
-                if response.clicked() || response.secondary_clicked() {
-                    let modifiers = response.ctx.input(|i| i.modifiers);
-                    out.clicked = Some((row.key.clone(), modifiers, response.secondary_clicked()));
-                }
-                response.context_menu(|ui| {
-                    if let Some(action) = menu(ui, row) {
-                        out.action = Some(action);
-                        ui.close();
-                    }
-                });
             });
-        });
+    });
     out
 }
 
@@ -578,13 +592,16 @@ pub struct Dashboard {
     tray: Option<crate::tray::Tray>,
     /// Hidden to the notification area.
     hidden: bool,
+    /// Window placement last seen and since when, saved once it stops changing.
+    window_seen: Option<(WindowPlacement, Instant)>,
 }
 
 impl Dashboard {
     pub fn new(cc: &eframe::CreationContext<'_>, data: DataDir, start_minimized: bool) -> Self {
         let ctx = cc.egui_ctx.clone();
         let (settings, warning) = Settings::load(&data);
-        ctx.set_theme(if settings.light_theme { egui::Theme::Light } else { egui::Theme::Dark });
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, settings.theme);
         let last_ctx_zoom = ctx.zoom_factor();
         ctx.set_zoom_factor(settings.zoom);
         let repaint = ctx.clone();
@@ -661,6 +678,7 @@ impl Dashboard {
             last_ctx_zoom,
             tray: None,
             hidden: false,
+            window_seen: None,
         };
         match crate::tray::Tray::new(&app.ctx) {
             Ok(tray) => app.tray = Some(tray),
@@ -892,7 +910,7 @@ impl Dashboard {
                     Selection::Finding(f.row_key()),
                     vec![
                         Cell::severity(Some(f.severity)),
-                        if new { Cell::num("NEW", 1.0).colored(Color32::from_rgb(90, 170, 255)) } else { Cell::empty() },
+                        if new { Cell::num("NEW", 1.0).colored(if theme::is_light() { Color32::from_rgb(31, 90, 160) } else { Color32::from_rgb(90, 170, 255) }) } else { Cell::empty() },
                         Cell::text(&f.module),
                         Cell::text(&f.subject),
                         Cell::text(&f.title),
@@ -1370,6 +1388,49 @@ impl Dashboard {
                     button: "Restore",
                     actions: vec![Action::Restore { id }],
                 });
+            }
+        }
+    }
+
+    /// Saves the window's placement once it has been still for a second, and only
+    /// while it is shown and not minimized (see `WindowPlacement`).
+    fn remember_window(&mut self, ctx: &egui::Context) {
+        let (minimized, maximized, outer, inner) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.minimized.unwrap_or(false), v.maximized.unwrap_or(false), v.outer_rect, v.inner_rect)
+        });
+        if self.hidden || minimized {
+            self.window_seen = None;
+            return;
+        }
+        let zoom = ctx.zoom_factor();
+        let current = outer.zip(inner).map(|(outer, inner)| WindowPlacement {
+            x: outer.min.x * zoom,
+            y: outer.min.y * zoom,
+            width: inner.width() * zoom,
+            height: inner.height() * zoom,
+            maximized,
+        });
+        // While maximized, keep the normal size to restore to.
+        let placement = match (maximized, self.settings.window) {
+            (true, Some(last)) => WindowPlacement { maximized: true, ..last },
+            _ => match current {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        if !placement.is_usable() {
+            return;
+        }
+        match self.window_seen {
+            Some((seen, since)) if seen == placement => {
+                if since.elapsed() >= Duration::from_secs(1) && self.settings.window != Some(placement) {
+                    self.settings.window = Some(placement);
+                }
+            }
+            _ => {
+                self.window_seen = Some((placement, Instant::now()));
+                ctx.request_repaint_after(Duration::from_millis(1100));
             }
         }
     }
@@ -1863,10 +1924,11 @@ impl Dashboard {
     fn details_pane(&mut self, ui: &mut egui::Ui) {
         let Some(selection) = self.selected.clone() else { return };
         let fields = self.selection_fields(&selection);
+        theme::caption(ui, "Details", false);
         ui.horizontal(|ui| {
             ui.heading(fields.as_ref().map_or("Selection", |(t, _)| t.as_str()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("×").on_hover_text("Close (Esc)").clicked() {
+                if theme::button(ui, "×").on_hover_text("Close (Esc)").clicked() {
                     self.clear_selection();
                 }
             });
@@ -1876,23 +1938,23 @@ impl Dashboard {
             return;
         };
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Copy").on_hover_text("Copy these details (Ctrl+C)").clicked() {
+            if theme::button(ui, "Copy").on_hover_text("Copy these details (Ctrl+C)").clicked() {
                 self.copy_selection();
             }
             let has_path = self.selection_path(&selection).is_some();
-            if has_path && ui.button("Open file location").clicked() {
+            if has_path && theme::button(ui, "Open file location").clicked() {
                 self.open_selection_location();
             }
-            if has_path && ui.button("File properties").clicked() {
+            if has_path && theme::button(ui, "File properties").clicked() {
                 self.apply_row_action(RowAction::Properties(selection.clone()));
             }
             if (has_path || matches!(selection, Selection::Quarantined(_)))
-                && ui.button("VirusTotal").on_hover_text("Opens your browser with the file's SHA-256").clicked()
+                && theme::button(ui, "VirusTotal").on_hover_text("Opens your browser with the file's SHA-256").clicked()
             {
                 self.apply_row_action(RowAction::VirusTotal(selection.clone()));
             }
             if let Some(pid) = self.selection_pid(&selection)
-                && ui.button(format!("Show process {pid}")).clicked()
+                && theme::button(ui, format!("Show process {pid}")).clicked()
             {
                 self.tab = Tab::Processes;
                 self.select(Selection::Process(pid));
@@ -1907,25 +1969,25 @@ impl Dashboard {
             let n = pids.len();
             let label = |text: &str| if n > 1 { format!("{text} ({n})") } else { text.to_string() };
             ui.horizontal_wrapped(|ui| {
-                if ui.button(label("End process…")).clicked() {
+                if theme::button(ui, label("End process…")).clicked() {
                     self.apply_row_action(RowAction::End(pids.clone()));
                 }
-                if pids.iter().any(|p| !suspended.contains(p)) && ui.button(label("Suspend")).clicked() {
+                if pids.iter().any(|p| !suspended.contains(p)) && theme::button(ui, label("Suspend")).clicked() {
                     self.apply_row_action(RowAction::Suspend(pids.clone()));
                 }
-                if pids.iter().any(|p| suspended.contains(p)) && ui.button(label("Resume")).clicked() {
+                if pids.iter().any(|p| suspended.contains(p)) && theme::button(ui, label("Resume")).clicked() {
                     self.apply_row_action(RowAction::Resume(pids.clone()));
                 }
-                if ui.button(label("End and quarantine…")).clicked() {
+                if theme::button(ui, label("End and quarantine…")).clicked() {
                     self.apply_row_action(RowAction::Quarantine(pids.clone()));
                 }
-                if ui.button(label("End tree…")).on_hover_text("End these and everything they started").clicked() {
+                if theme::button(ui, label("End tree…")).on_hover_text("End these and everything they started").clicked() {
                     self.apply_row_action(RowAction::EndTree(pids.clone()));
                 }
             });
         }
         if let Selection::Quarantined(id) = &selection
-            && ui.button("Restore to original location…").clicked()
+            && theme::button(ui, "Restore to original location…").clicked()
         {
             self.apply_row_action(RowAction::Restore(id.clone()));
         }
@@ -1937,13 +1999,9 @@ impl Dashboard {
         };
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if let Some(help) = &help {
-                egui::Frame::new().fill(ui.visuals().faint_bg_color).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
-                    ui.strong("What this means");
-                    ui.add(egui::Label::new(help.meaning).wrap());
-                    ui.add_space(4.0);
-                    ui.strong("What you can do");
-                    ui.add(egui::Label::new(help.next_steps).wrap());
-                });
+                theme::group_box(ui, "What this means", |ui| ui.add(egui::Label::new(help.meaning).wrap()));
+                ui.add_space(4.0);
+                theme::group_box(ui, "What you can do", |ui| ui.add(egui::Label::new(help.next_steps).wrap()));
                 ui.add_space(6.0);
             }
             for (label, value) in fields.iter().filter(|(_, v)| !v.is_empty()) {
@@ -2217,12 +2275,11 @@ impl Dashboard {
                     self.set_zoom(1.0);
                 }
                 ui.separator();
-                let mut light = self.settings.light_theme;
-                let dark_clicked = ui.radio_value(&mut light, false, "Dark theme").clicked();
-                let light_clicked = ui.radio_value(&mut light, true, "Light theme").clicked();
-                if dark_clicked || light_clicked {
-                    self.settings.light_theme = light;
-                    self.ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
+                ui.label(RichText::new("Theme").weak());
+                for choice in Theme::ALL {
+                    if ui.radio_value(&mut self.settings.theme, choice, choice.label()).clicked() {
+                        theme::apply(&self.ctx, choice);
+                    }
                 }
             });
             ui.menu_button("Scan", |ui| {
@@ -2370,27 +2427,27 @@ impl Dashboard {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             let idle = self.pending_scans == 0;
-            if ui.button("Refresh").on_hover_text("Refresh live data and inventories (F5)").clicked() {
+            if theme::button(ui, "Refresh").on_hover_text("Refresh live data and inventories (F5)").clicked() {
                 self.refresh_now();
             }
-            if ui.add_enabled(idle, egui::Button::new("Scan all")).on_hover_text("ntdll integrity + process scan, logged").clicked() {
+            if theme::button_enabled(ui, idle, egui::Button::new("Scan all")).on_hover_text("ntdll integrity + process scan, logged").clicked() {
                 self.scan_all();
             }
-            if ui.add_enabled(idle, egui::Button::new("Scan ntdll")).clicked() {
+            if theme::button_enabled(ui, idle, egui::Button::new("Scan ntdll")).clicked() {
                 self.send(Command::ScanIntegrity { compare_memory: self.settings.compare_memory });
             }
-            if ui.add_enabled(idle, egui::Button::new("Scan processes")).clicked() {
+            if theme::button_enabled(ui, idle, egui::Button::new("Scan processes")).clicked() {
                 self.send(Command::ScanProcesses);
             }
             ui.separator();
             let path = self.selected.as_ref().and_then(|s| self.selection_path(s));
-            if ui.add_enabled(path.is_some(), egui::Button::new("Open folder")).clicked() {
+            if theme::button_enabled(ui, path.is_some(), egui::Button::new("Open folder")).clicked() {
                 self.open_selection_location();
             }
-            if ui.add_enabled(self.selected.is_some(), egui::Button::new("Copy")).on_hover_text("Ctrl+C: selected rows, or the details of one").clicked() {
+            if theme::button_enabled(ui, self.selected.is_some(), egui::Button::new("Copy")).on_hover_text("Ctrl+C: selected rows, or the details of one").clicked() {
                 self.pending_rows_op = Some(RowsOp::Copy);
             }
-            ui.menu_button("Export…", |ui| {
+            let export = ui.menu_button("Export…", |ui| {
                 if ui.button(format!("{} view as CSV…", self.tab.label())).clicked() {
                     self.export_current_view();
                     ui.close();
@@ -2403,16 +2460,18 @@ impl Dashboard {
                     self.export_report();
                     ui.close();
                 }
-            });
+            })
+            .response;
+            theme::raise(ui, &export);
             let paused = !self.settings.live_refresh;
             if ui.selectable_label(paused, if paused { "Resume" } else { "Pause" }).on_hover_text("Pause automatic refresh").clicked() {
                 self.settings.live_refresh = paused;
             }
             ui.separator();
-            if ui.add_enabled(idle && !self.has_baseline, egui::Button::new("Capture baseline")).clicked() {
+            if theme::button_enabled(ui, idle && !self.has_baseline, egui::Button::new("Capture baseline")).clicked() {
                 self.send(Command::CaptureBaseline);
             }
-            if self.has_baseline && ui.add_enabled(idle, egui::Button::new("Archive baseline…")).clicked() {
+            if self.has_baseline && theme::button_enabled(ui, idle, egui::Button::new("Archive baseline…")).clicked() {
                 self.confirm_archive = true;
             }
         });
@@ -2420,7 +2479,8 @@ impl Dashboard {
 
     fn status_bar(&self, ui: &mut egui::Ui, shown: usize) {
         ui.horizontal(|ui| {
-            match self.current {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            theme::status_cell(ui, |ui| match self.current {
                 Some(what) => {
                     ui.spinner();
                     ui.label(what);
@@ -2428,38 +2488,44 @@ impl Dashboard {
                 None => {
                     ui.label("Idle");
                 }
-            }
-            ui.separator();
-            if self.marked.len() > 1 {
-                ui.label(format!("{shown} entries shown · {} selected", self.marked.len()));
-            } else {
-                ui.label(format!("{shown} entries shown"));
-            }
-            ui.separator();
-            ui.label(if self.settings.live_refresh {
-                format!("Live refresh every {} s", self.settings.live_refresh_seconds)
-            } else {
-                "Live refresh paused".into()
             });
-            ui.separator();
-            if self.settings.scheduled_scans {
-                let left = self.settings.scan_interval().saturating_sub(self.last_scheduled.elapsed());
-                ui.label(format!("Next scheduled scan in {} min", left.as_secs().div_ceil(60)));
-            } else {
-                ui.label("Scheduled scans off");
-            }
-            ui.separator();
-            ui.label(if self.has_baseline { "Baseline: present" } else { "Baseline: none" });
-            ui.separator();
-            if self.elevated {
-                ui.label("Administrator");
-            } else {
-                ui.label(RichText::new("Not running as administrator").color(severity_color(Severity::Medium))).on_hover_text(
-                    "Some processes, services and drivers can't be read. Right-click NtSentry > Run as administrator to see everything.",
-                );
-            }
-            ui.separator();
-            ui.label(RichText::new("Scans are read-only; actions ask first").weak());
+            theme::status_cell(ui, |ui| {
+                if self.marked.len() > 1 {
+                    ui.label(format!("{shown} entries shown · {} selected", self.marked.len()));
+                } else {
+                    ui.label(format!("{shown} entries shown"));
+                }
+            });
+            theme::status_cell(ui, |ui| {
+                ui.label(if self.settings.live_refresh {
+                    format!("Live refresh every {} s", self.settings.live_refresh_seconds)
+                } else {
+                    "Live refresh paused".into()
+                });
+            });
+            theme::status_cell(ui, |ui| {
+                if self.settings.scheduled_scans {
+                    let left = self.settings.scan_interval().saturating_sub(self.last_scheduled.elapsed());
+                    ui.label(format!("Next scheduled scan in {} min", left.as_secs().div_ceil(60)));
+                } else {
+                    ui.label("Scheduled scans off");
+                }
+            });
+            theme::status_cell(ui, |ui| {
+                ui.label(if self.has_baseline { "Baseline: present" } else { "Baseline: none" });
+            });
+            theme::status_cell(ui, |ui| {
+                if self.elevated {
+                    ui.label("Administrator");
+                } else {
+                    ui.label(RichText::new("Not running as administrator").color(severity_color(Severity::Medium))).on_hover_text(
+                        "Some processes, services and drivers can't be read. Right-click NtSentry > Run as administrator to see everything.",
+                    );
+                }
+            });
+            theme::status_cell(ui, |ui| {
+                ui.label(RichText::new("Scans are read-only; actions ask first").weak());
+            });
         });
     }
 
@@ -2519,10 +2585,10 @@ impl Dashboard {
                 ui.add(egui::Label::new(text).wrap());
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new(button).strong().color(Color32::from_rgb(230, 90, 70))).clicked() {
+                    if theme::button(ui, RichText::new(button).strong().color(Color32::from_rgb(230, 90, 70))).clicked() {
                         decision = Some(true);
                     }
-                    if ui.button("Cancel").clicked() {
+                    if theme::button(ui, "Cancel").clicked() {
                         decision = Some(false);
                     }
                 });
@@ -2547,11 +2613,11 @@ impl Dashboard {
                 ui.label("The current baseline folder is renamed to baseline-archived-<time>. Nothing is deleted.");
                 ui.label("Capture a new baseline afterwards, on a system you trust is clean.");
                 ui.horizontal(|ui| {
-                    if ui.button("Archive").clicked() {
+                    if theme::button(ui, "Archive").clicked() {
                         self.send(Command::ArchiveBaseline);
                         self.confirm_archive = false;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if theme::button(ui, "Cancel").clicked() {
                         self.confirm_archive = false;
                     }
                 });
@@ -2740,6 +2806,7 @@ impl eframe::App for Dashboard {
             self.settings.zoom = zoom;
         }
 
+        self.remember_window(ctx);
         let minimized = self.hidden || ctx.input(|i| i.viewport().minimized).unwrap_or(false);
         if self.settings.minimize_to_tray && self.tray.is_some() && minimized && !self.hidden {
             self.hidden = true;
@@ -2818,7 +2885,7 @@ impl eframe::App for Dashboard {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, shown));
         if self.settings.show_activity {
             egui::Panel::bottom("activity").resizable(true).default_size(90.0).min_size(40.0).show(ui, |ui| {
-                ui.strong("Activity");
+                theme::caption(ui, "Activity", false);
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink(false).show(ui, |ui| {
                     for (t, m) in &self.activity {
                         ui.label(format!("{}  {m}", format_utc(*t)));
@@ -2849,10 +2916,10 @@ impl eframe::App for Dashboard {
         egui::CentralPanel::default().show(ui, |ui| {
             self.summary(ui);
             if let Some(alert) = self.alert.clone() {
-                egui::Frame::new().fill(Color32::from_rgb(110, 40, 30)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                egui::Frame::new().fill(Color32::from_rgb(110, 40, 30)).inner_margin(6.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("ALERT: {alert}")).color(Color32::WHITE).strong());
-                        if ui.button("Dismiss").clicked() {
+                        if theme::button(ui, "Dismiss").clicked() {
                             self.alert = None;
                         }
                     });
@@ -2866,7 +2933,7 @@ impl eframe::App for Dashboard {
                         .hint_text("Filter by name, PID, path or any text… (Ctrl+F)")
                         .desired_width(420.0),
                 );
-                if !self.filter.is_empty() && ui.button("×").on_hover_text("Clear").clicked() {
+                if !self.filter.is_empty() && theme::button(ui, "×").on_hover_text("Clear").clicked() {
                     self.filter.clear();
                 }
                 ui.separator();
@@ -2885,17 +2952,19 @@ impl eframe::App for Dashboard {
             ui.separator();
             let findings_height = (ui.available_height() * 0.33).max(110.0);
             egui::Panel::top("findings_pane").resizable(true).default_size(findings_height).min_size(70.0).show(ui, |ui| {
-                ui.strong(format!("Findings ({} shown)", visible_findings.len()));
+                theme::caption(ui, &format!("Findings ({} shown)", visible_findings.len()), true);
                 let sort = self.sorts.get(findings_spec.id).copied().unwrap_or((0, false));
                 outputs.push((findings_spec.id, render_table(ui, &findings_spec, &findings_cols, &visible_findings, sort, &marked, scroll_findings, &menu)));
             });
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 for tab in Tab::ALL {
                     let label = format!("{} ({})", tab.label(), self.tab_count(tab));
-                    if ui.selectable_label(self.tab == tab, label).clicked() {
+                    if theme::tab(ui, self.tab == tab, &label).clicked() {
                         self.tab = tab;
                     }
                 }
+                ui.add_space(8.0);
                 if self.tab != Tab::Processes && self.inventory.is_none() {
                     ui.spinner();
                     ui.label("Loading inventories…");
@@ -2923,7 +2992,22 @@ mod tests {
         clicks: &[Pos2],
         pointer: egui::PointerButton,
     ) -> (Vec<Selection>, Vec<usize>, Vec<Selection>, bool) {
+        run_themed_frames(None, rows, spec, clicks, pointer)
+    }
+
+    /// `run_frames`, optionally with the fonts and a theme applied first.
+    fn run_themed_frames(
+        theme: Option<Theme>,
+        rows: &[Row],
+        spec: &Spec,
+        clicks: &[Pos2],
+        pointer: egui::PointerButton,
+    ) -> (Vec<Selection>, Vec<usize>, Vec<Selection>, bool) {
         let ctx = egui::Context::default();
+        if let Some(choice) = theme {
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, choice);
+        }
         let refs: Vec<&Row> = rows.iter().collect();
         let mut selected = Vec::new();
         let mut sorted = Vec::new();
@@ -3039,6 +3123,42 @@ mod tests {
         assert_eq!(visible_columns(&spec, Some(&hidden)), vec![1]);
         let all = vec!["PID".to_string(), "Name".to_string()];
         assert_eq!(visible_columns(&spec, Some(&all)), vec![0, 1], "never hide every column");
+    }
+
+    #[test]
+    fn themed_tables_still_sort_and_select() {
+        let (rows, spec) = sample();
+        let third_row_y = (ROW_HEIGHT + 2.0) + 2.5 * (ROW_HEIGHT + 3.0);
+        let clicks = [pos2(140.0, 10.0), pos2(300.0, third_row_y)];
+        let (selected, sorted, _, _) = run_themed_frames(Some(Theme::Slate), &rows, &spec, &clicks, egui::PointerButton::Primary);
+        assert_eq!(sorted, vec![1]);
+        assert_eq!(selected, vec![Selection::Process(3)]);
+    }
+
+    #[test]
+    fn every_theme_draws_its_widgets() {
+        for choice in Theme::ALL {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, choice);
+            for _ in 0..2 {
+                let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0))), ..Default::default() };
+                let mut output = ctx.run_ui(input, |ui| {
+                    theme::caption(ui, "Findings (1 shown)", true);
+                    ui.horizontal(|ui| {
+                        theme::tab(ui, true, "Processes (3)");
+                        theme::tab(ui, false, "Services (2)");
+                    });
+                    theme::button(ui, "Refresh");
+                    theme::group_box(ui, "What this means", |ui| ui.label("Explanation"));
+                    theme::status_cell(ui, |ui| ui.label("Idle"));
+                    theme::well(ui, |ui| ui.label("List"));
+                });
+                output.textures_delta.clear();
+            }
+            assert_eq!(ctx.style_of(ctx.theme()).visuals.dark_mode, choice != Theme::Light, "{choice:?}");
+            assert_eq!(theme::is_light(), choice == Theme::Light);
+        }
     }
 
     #[test]

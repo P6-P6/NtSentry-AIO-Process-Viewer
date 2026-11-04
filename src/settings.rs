@@ -34,14 +34,65 @@ pub struct Settings {
     /// and scheduled scans.
     pub deep_scans: bool,
     pub show_activity: bool,
+    pub theme: Theme,
+    /// Read from files written before `theme` existed (true meant Light); never written.
+    #[serde(skip_serializing)]
     pub light_theme: bool,
     pub zoom: f32,
+    /// Last window placement while shown; see `WindowPlacement`.
+    pub window: Option<WindowPlacement>,
     /// Hidden column titles per table id.
     pub hidden_columns: BTreeMap<String, Vec<String>>,
     /// Sort column title and direction (true = ascending) per table id.
     pub sorts: BTreeMap<String, (String, bool)>,
     /// Inventory tab shown last.
     pub last_tab: String,
+}
+
+/// Colour scheme. All three share the classic layout: raised buttons and
+/// headers, sunken tables and caption bars.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    #[default]
+    Slate,
+    Charcoal,
+    Light,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::Slate, Theme::Charcoal, Theme::Light];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Slate => "Slate (dark blue-grey)",
+            Theme::Charcoal => "Charcoal (dark)",
+            Theme::Light => "Light",
+        }
+    }
+}
+
+/// Window position and size in logical pixels (independent of zoom), recorded
+/// only while the window is shown and not minimized: Windows reports a minimized
+/// window as tiny and parked near -32000, which must never be restored.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+}
+
+impl WindowPlacement {
+    /// Large enough to use and not parked off-screen.
+    pub fn is_usable(&self) -> bool {
+        [self.x, self.y, self.width, self.height].iter().all(|v| v.is_finite())
+            && self.width >= 400.0
+            && self.height >= 300.0
+            && self.x > -10_000.0
+            && self.y > -10_000.0
+    }
 }
 
 impl Default for Settings {
@@ -62,8 +113,10 @@ impl Default for Settings {
             minimize_to_tray: true,
             deep_scans: true,
             show_activity: true,
+            theme: Theme::Slate,
             light_theme: false,
             zoom: 1.0,
+            window: None,
             hidden_columns: BTreeMap::from([("processes".to_string(), vec!["Command line".to_string()])]),
             sorts: BTreeMap::new(),
             last_tab: "Processes".into(),
@@ -96,6 +149,12 @@ impl Settings {
     }
 
     pub fn sanitized(mut self) -> Self {
+        if std::mem::take(&mut self.light_theme) {
+            self.theme = Theme::Light;
+        }
+        if self.window.is_some_and(|w| !w.is_usable()) {
+            self.window = None;
+        }
         self.scan_interval_minutes = self.scan_interval_minutes.clamp(5, 1440);
         self.live_refresh_seconds = self.live_refresh_seconds.clamp(1, 300);
         if !self.zoom.is_finite() {
@@ -127,7 +186,7 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert!(warning.is_none());
 
-        let changed = Settings { scan_interval_minutes: 30, light_theme: true, ..Settings::default() };
+        let changed = Settings { scan_interval_minutes: 30, theme: Theme::Charcoal, ..Settings::default() };
         changed.save(&data).unwrap();
         changed.save(&data).unwrap();
         assert_eq!(Settings::load(&data).0, changed);
@@ -136,6 +195,16 @@ mod tests {
         let (s, _) = Settings::load(&data);
         assert_eq!(s.scan_interval_minutes, 5);
         assert!(s.scan_on_open);
+
+        std::fs::write(data.settings_path(), r#"{"light_theme": true}"#).unwrap();
+        assert_eq!(Settings::load(&data).0.theme, Theme::Light);
+
+        let parked = r#"{"window": {"x": -32000.0, "y": -32000.0, "width": 160.0, "height": 28.0, "maximized": false}}"#;
+        std::fs::write(data.settings_path(), parked).unwrap();
+        assert_eq!(Settings::load(&data).0.window, None, "a minimized window's placement is dropped");
+        let normal = WindowPlacement { x: 40.0, y: 30.0, width: 1400.0, height: 880.0, maximized: true };
+        Settings { window: Some(normal), ..Settings::default() }.save(&data).unwrap();
+        assert_eq!(Settings::load(&data).0.window, Some(normal));
 
         std::fs::write(data.settings_path(), "not json").unwrap();
         let (s, warning) = Settings::load(&data);

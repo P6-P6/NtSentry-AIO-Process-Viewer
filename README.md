@@ -15,7 +15,8 @@ A Windows utility that looks for signs of userland tampering and shows them, tog
 - **Notification area:** a tray icon with Show dashboard / Scan now / Exit. Minimizing hides the window to the tray (setting). The icon turns red and its tooltip shows the alert while one is active.
 - **Find** (Ctrl+F) filters the findings and the current tab by any text.
 - **Shortcuts:** F5 refresh, Ctrl+S export the current view, Ctrl+A select all, Ctrl+C copy, Esc clear the selection.
-- **Layout is remembered:** window size and position, pane sizes, column widths, hidden columns, sort order and the last tab.
+- **Themes:** View > Theme switches immediately between Slate (dark blue-grey, the default), Charcoal (dark) and Light. All three use a classic Windows layout: raised buttons and column headers, sunken lists, caption bars and Segoe UI at the normal Windows text size. The choice is saved.
+- **Layout is remembered:** window size and position (only while the window is shown, so closing from the tray never reopens it tiny), pane sizes, column widths, hidden columns, sort order, the theme and the last tab. Settings are in `settings.json` and pane state in `ui-state.ron` in the data folder.
 
 Command lines can contain sensitive arguments such as tokens. They are only shown on screen, and only exported when the Command line column is shown.
 
@@ -89,6 +90,7 @@ When enabled, new findings go to the Application log under source `NtSentry`, ev
 | `build.rs` | Embeds the icon and version details into `ntsentry.exe` |
 | `src/worker.rs` | Scan thread and live-refresh thread; results reach the UI over `std::sync::mpsc` |
 | `src/app.rs` | The egui dashboard |
+| `src/theme.rs` | Themes: palettes, system fonts, and the raised, sunken and caption drawing |
 | `src/main.rs` | Entry point and headless CLI |
 | `src/settings.rs`, `src/autostart.rs` | Preferences and the opt-in sign-in entry |
 | `src/export.rs`, `src/dialogs.rs` | CSV/JSON exports and the Save As dialog |
