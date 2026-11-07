@@ -1,12 +1,12 @@
 # NtSentry AIO Process Viewer
 
-A Windows utility that looks for signs of userland tampering and shows them, together with a full system inventory, in an egui dashboard for a person to review. Scans are read-only: they never write to process memory, change page protection, or restore ("unhook") bytes. The only changes the program makes are process actions that you confirm.
+A Windows utility that looks for signs of userland tampering and shows them, together with a full system inventory, in an egui dashboard for a person to review. Scans are read-only: they never write to process memory, change page protection, or restore ("unhook") bytes. The only changes the program makes are process actions and startup entry switches that you confirm.
 
 ## The dashboard
 
 - **Menu bar:** File (exports, data folder, findings log), Edit (copy, open file location), View (refresh, pause, filters, zoom, theme), Scan, Baseline, Settings, Help.
 - **Findings pane** (always visible): everything the scans found, most severe first. **NEW** marks findings that were not in the previous scan of the same kind; the previous scan is read from the log, so this works across restarts.
-- **Inventory tabs:** Processes (live CPU, memory, threads, session, user, start time and, optionally, command line), Services, Drivers, Startup, Connections and Quarantine. Every entry is shown. Click a column header to sort; CPU %, Memory, Threads and Size start with the largest. Processes, services, drivers and startup entries carry a **Flag** column with their worst finding.
+- **Inventory tabs:** Processes (live CPU, memory, threads, session, user, start time and, optionally, command line), Services, Drivers, Startup, Connections and Quarantine. Every entry is shown. Click a column header to sort; CPU %, Memory, Threads and Size start with the largest. Processes, services, drivers and startup entries carry a **Flag** column with their worst finding, and startup entries a **Status** column with what Windows will do at the next sign-in.
 - **Columns:** right-click a column header > Columns to show or hide columns. Copies and exports include only the shown columns; the full JSON report always has everything.
 - **Selecting rows:** click, Ctrl+click, Shift+click, arrow keys and Shift+arrow keys, Home/End, PageUp/PageDown, Ctrl+A for all. Ctrl+C copies the selected rows as tab-separated text; right-click acts on all selected rows.
 - **Process tree:** View > Process tree (or the Tree box) shows parent/child relationships. A parent that started after its child is a reused PID, so that child is shown as a root. Sorting orders each parent's children and the top-level processes.
@@ -33,6 +33,20 @@ Right-click a process, or use the details pane or the Edit menu. With several pr
 | **Restore** (Quarantine tab) | Asks first, writes the file back only if nothing exists at the original path, and checks the hash. The entry is kept as `<id>.restored`. |
 
 Before any action the PID and its start time are re-checked, so a PID that now belongs to another program is never touched. Idle, System, Windows critical processes and the dashboard itself are refused. Files under the Windows folder cannot be quarantined. Every action, successful or not, is written to `findings.jsonl` (kind `action`). The masking is obfuscation, not encryption.
+
+### Startup entries
+
+Right-click a row on the Startup tab, or use the details pane or the Edit menu, to **Disable** or **Enable** it. With several rows selected, one confirmation covers all of them.
+
+This is the same switch that Task Manager's Startup apps page and Settings > Apps > Startup use, stored under `...\Explorer\StartupApproved`. The Run value or shortcut itself is never changed, so nothing is deleted and any change can be undone. A change applies from the next sign-in; a program that is already running keeps running.
+
+| Status | Meaning |
+|---|---|
+| **Enabled** | Windows starts it at sign-in. |
+| **Disabled** | Windows skips it at sign-in. Scans still check it. |
+| **Not switchable** | Windows has no switch for it: RunOnce entries and `desktop.ini`. |
+
+All-users entries (HKLM and the ProgramData startup folder) need NtSentry running as administrator; without that their menu items are greyed out. Before writing, the entry is re-read, and one that changed since it was listed is left alone. Every change is written to `findings.jsonl` (kind `action`).
 
 ### Settings
 

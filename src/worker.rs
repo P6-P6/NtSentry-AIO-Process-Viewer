@@ -7,7 +7,7 @@
 
 use crate::findings::{Finding, ScanReport, Severity};
 use crate::integrity_monitor::{self, CaptureOutcome, IntegrityReport};
-use crate::inventory::{self, Monitor, ProcessDetails, ProcessIdentity, ProcessSnapshot, SystemInventory};
+use crate::inventory::{self, AutorunInfo, Monitor, ProcessDetails, ProcessIdentity, ProcessSnapshot, SystemInventory};
 use crate::process_inventory::{self, KnownDirs, ProcessInventory, ProcessReport};
 use crate::signature::SignatureCache;
 use crate::{module_audit, persistence_audit};
@@ -37,7 +37,7 @@ pub enum LiveCommand {
     Act(Action),
 }
 
-/// A user-confirmed change. Each one re-checks the process identity first.
+/// A user-confirmed change. Each one re-checks its target first.
 #[derive(Clone, Debug)]
 pub enum Action {
     End { identity: ProcessIdentity, name: String },
@@ -46,6 +46,8 @@ pub enum Action {
     /// End the process, then move its file into quarantine.
     Quarantine { identity: ProcessIdentity, name: String, path: String, signature: String },
     Restore { id: String },
+    /// Turn a startup entry off or on for future sign-ins.
+    SetStartup { entry: AutorunInfo, disable: bool },
 }
 
 #[derive(Debug)]
@@ -221,6 +223,14 @@ fn perform(data: &DataDir, action: Action) -> (bool, String, String) {
             Ok(path) => (true, format!("Restored {path} from quarantine"), format!("quarantine {id}")),
             Err(e) => (false, format!("Could not restore quarantine entry {id}: {e}"), format!("quarantine {id}")),
         },
+        Action::SetStartup { entry, disable } => {
+            let who = persistence_audit::subject(persistence_audit::EntryKind::Startup, &entry.name, &entry.location);
+            let (done, verb) = if disable { ("Disabled", "disable") } else { ("Enabled", "enable") };
+            match crate::startup_control::set_disabled(&entry, disable) {
+                Ok(()) => (true, format!("{done} {} at startup; this applies from the next sign-in", entry.name), who),
+                Err(e) => (false, format!("Could not {verb} {}: {e}", entry.name), who),
+            }
+        }
     }
 }
 

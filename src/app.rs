@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ntsentry::findings::{Finding, ScanReport, Severity};
 use ntsentry::integrity_monitor::{self, IntegrityReport};
 use ntsentry::inventory::{
-    ProcessDetails, ProcessIdentity, ProcessInfo, ProcessSnapshot, SystemInventory, image_path_from_command,
+    AutorunInfo, ProcessDetails, ProcessIdentity, ProcessInfo, ProcessSnapshot, SystemInventory, image_path_from_command,
 };
 use ntsentry::process_inventory::{self, ProcessRecord, ProcessReport};
 use ntsentry::settings::{Settings, Theme, WindowPlacement};
@@ -167,6 +167,8 @@ enum RowAction {
     Properties(Selection),
     ToggleColumn(&'static str, &'static str),
     ShowAllColumns(&'static str),
+    /// The entries to change, and whether to disable them.
+    SetStartup(Vec<AutorunInfo>, bool),
 }
 
 /// A pending action shown in a confirmation dialog.
@@ -177,19 +179,87 @@ struct Confirm {
     actions: Vec<Action>,
 }
 
+const NEEDS_ADMIN: &str = "All-users entries can only be changed when NtSentry runs as administrator.";
+
+/// The row key of a startup entry.
+fn startup_key(a: &AutorunInfo) -> String {
+    format!("{}|{}|{}", a.location, a.name, a.command)
+}
+
+/// Switchable entries a startup action on `selection` covers: every selected
+/// entry when the row is part of a multi-selection, else just that one.
+fn startup_targets(entries: &[AutorunInfo], selection: &Selection, marked: &HashSet<Selection>) -> Vec<AutorunInfo> {
+    let Selection::Startup(key) = selection else { return Vec::new() };
+    let whole_selection = marked.len() > 1 && marked.contains(selection);
+    entries
+        .iter()
+        .filter(|a| a.switch.is_some())
+        .filter(|a| {
+            let own = startup_key(a);
+            if whole_selection { marked.contains(&Selection::Startup(own)) } else { own == *key }
+        })
+        .cloned()
+        .collect()
+}
+
+/// A Disable or Enable choice for the selected startup entries.
+struct StartupChoice {
+    label: String,
+    disable: bool,
+    /// The entries this would actually change.
+    targets: Vec<AutorunInfo>,
+    /// All of them need administrator rights this run does not have.
+    blocked: bool,
+}
+
+/// One choice per direction that would change at least one of `entries`.
+fn startup_choices(entries: &[AutorunInfo], elevated: bool) -> Vec<StartupChoice> {
+    [("Disable", true), ("Enable", false)]
+        .into_iter()
+        .filter_map(|(verb, disable)| {
+            let targets: Vec<AutorunInfo> = entries.iter().filter(|a| a.disabled != disable).cloned().collect();
+            let label = match targets.len() {
+                0 => return None,
+                1 => format!("{verb} at startup…"),
+                n => format!("{verb} at startup ({n} entries)…"),
+            };
+            let blocked = !elevated && targets.iter().all(AutorunInfo::needs_admin);
+            Some(StartupChoice { label, disable, targets, blocked })
+        })
+        .collect()
+}
+
+/// Menu items for the choices; returns what was clicked.
+fn startup_menu_items(ui: &mut egui::Ui, choices: &[StartupChoice]) -> Option<RowAction> {
+    let mut chosen = None;
+    for choice in choices {
+        let item = ui.add_enabled(!choice.blocked, egui::Button::new(&choice.label)).on_disabled_hover_text(NEEDS_ADMIN);
+        if item.clicked() {
+            chosen = Some(RowAction::SetStartup(choice.targets.clone(), choice.disable));
+        }
+    }
+    chosen
+}
+
 /// Right-click menu for a row. `targets` are the PIDs a process action applies to
 /// (all selected processes when the row is part of a multi-selection); `suspended`
-/// holds PIDs the dashboard suspended; `selected` is how many rows are selected;
-/// `has_file` says whether a process or finding row points at a file.
+/// holds PIDs the dashboard suspended; `startup` holds the choices for a startup
+/// row; `selected` is how many rows are selected; `has_file` says whether a process
+/// or finding row points at a file.
 fn row_menu(
     ui: &mut egui::Ui,
     selection: &Selection,
     targets: &[u32],
     suspended: &HashSet<u32>,
+    startup: &[StartupChoice],
     selected: usize,
     has_file: bool,
 ) -> Option<RowAction> {
     let mut chosen = None;
+    if !startup.is_empty() {
+        chosen = startup_menu_items(ui, startup);
+        ui.separator();
+    }
     if matches!(selection, Selection::Process(_)) && !targets.is_empty() {
         let n = targets.len();
         let label = |text: &str| if n > 1 { format!("{text} ({n} processes)") } else { text.to_string() };
@@ -962,6 +1032,7 @@ impl Dashboard {
                 id: "startup",
                 columns: vec![
                     ("Flag", Column::exact(66.0)),
+                    ("Status", Column::initial(100.0)),
                     ("Location", Column::initial(320.0)),
                     ("Name", Column::initial(200.0)),
                     ("Command", Column::remainder()),
@@ -1136,8 +1207,14 @@ impl Dashboard {
                     .map(|a| {
                         let severity = flags.get(&persistence_audit::subject(EntryKind::Startup, &a.name, &a.location)).copied();
                         let mut row = Row::new(
-                            Selection::Startup(format!("{}|{}|{}", a.location, a.name, a.command)),
-                            vec![Cell::severity(severity), Cell::text(&a.location), Cell::text(&a.name), Cell::text(&a.command)],
+                            Selection::Startup(startup_key(a)),
+                            vec![
+                                Cell::severity(severity),
+                                Cell::text(a.status()),
+                                Cell::text(&a.location),
+                                Cell::text(&a.name),
+                                Cell::text(&a.command),
+                            ],
                         );
                         row.severity = severity;
                         row
@@ -1248,6 +1325,12 @@ impl Dashboard {
             }
         }
         targets
+    }
+
+    /// Disable/Enable choices for `selection`; empty unless it is a switchable startup row.
+    fn startup_choices_for(&self, selection: &Selection) -> Vec<StartupChoice> {
+        let entries = self.inventory.as_ref().map_or(&[][..], |i| i.startup.as_slice());
+        startup_choices(&startup_targets(entries, selection, &self.marked), self.elevated)
     }
 
     /// PIDs a process action on `selection` applies to: every selected process
@@ -1387,6 +1470,39 @@ impl Dashboard {
                     text: format!("{path}\n\nThe file is written back to its original location. Nothing existing is overwritten."),
                     button: "Restore",
                     actions: vec![Action::Restore { id }],
+                });
+            }
+            RowAction::SetStartup(entries, disable) => {
+                let mut targets = Vec::new();
+                for entry in entries {
+                    if entry.needs_admin() && !self.elevated {
+                        self.note(format!("{}: {NEEDS_ADMIN} Skipped.", entry.name));
+                    } else {
+                        targets.push(entry);
+                    }
+                }
+                if targets.is_empty() {
+                    return;
+                }
+                let verb = if disable { "Disable" } else { "Enable" };
+                let title = match targets.as_slice() {
+                    [entry] => format!("{verb} {} at startup?", entry.name),
+                    _ => format!("{verb} {} startup entries?", targets.len()),
+                };
+                let it = if targets.len() == 1 { "this" } else { "these" };
+                let effect = if disable {
+                    format!(
+                        "Windows stops starting {it} at your next sign-in. Anything already running keeps running. \
+                         Nothing is deleted, and you can enable {it} again here or in Windows."
+                    )
+                } else {
+                    format!("Windows starts {it} again at your next sign-in.")
+                };
+                self.confirm = Some(Confirm {
+                    title,
+                    text: format!("{}\n\n{effect}", describe_startup(&targets)),
+                    button: verb,
+                    actions: targets.into_iter().map(|entry| Action::SetStartup { entry, disable }).collect(),
                 });
             }
         }
@@ -1801,11 +1917,12 @@ impl Dashboard {
                     .as_ref()?
                     .startup
                     .iter()
-                    .find(|a| &format!("{}|{}|{}", a.location, a.name, a.command) == key)?;
+                    .find(|a| &startup_key(a) == key)?;
                 Some((
                     format!("Startup entry {}", a.name),
                     vec![
                         ("Name", a.name.clone()),
+                        ("Status", a.status().to_string()),
                         ("Location", a.location.clone()),
                         ("Command", a.command.clone()),
                         ("Resolved file", image_path_from_command(&a.command).unwrap_or_default()),
@@ -1990,6 +2107,17 @@ impl Dashboard {
             && theme::button(ui, "Restore to original location…").clicked()
         {
             self.apply_row_action(RowAction::Restore(id.clone()));
+        }
+        let startup = self.startup_choices_for(&selection);
+        if !startup.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for choice in startup {
+                    let button = theme::button_enabled(ui, !choice.blocked, egui::Button::new(&choice.label));
+                    if button.on_disabled_hover_text(NEEDS_ADMIN).clicked() {
+                        self.apply_row_action(RowAction::SetStartup(choice.targets, choice.disable));
+                    }
+                }
+            });
         }
         ui.separator();
         let mut navigate = None;
@@ -2229,6 +2357,14 @@ impl Dashboard {
                     }
                     if ui.button(label("End and quarantine…")).clicked() {
                         self.apply_row_action(RowAction::Quarantine(pids.clone()));
+                        ui.close();
+                    }
+                }
+                let startup = self.selected.as_ref().map(|s| self.startup_choices_for(s)).unwrap_or_default();
+                if !startup.is_empty() {
+                    ui.separator();
+                    if let Some(action) = startup_menu_items(ui, &startup) {
+                        self.apply_row_action(action);
                         ui.close();
                     }
                 }
@@ -2630,7 +2766,7 @@ impl Dashboard {
             ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
             ui.label("Tamper detection, system inventory and confirmed process actions for Windows.");
             ui.label("Scans never write to process memory, change protections, or restore bytes.");
-            ui.label("Process actions (end, suspend, quarantine) run only after you confirm them, and are logged.");
+            ui.label("Process actions (end, suspend, quarantine) and startup changes run only after you confirm them, and are logged.");
             ui.label(format!("Data folder: {}", self.data.root.display()));
         });
         egui::Window::new("How to use").open(&mut self.show_help).default_width(520.0).show(ctx, |ui| {
@@ -2641,6 +2777,7 @@ impl Dashboard {
             ui.label("• Right-click a column header to show or hide columns. Copies and exports include only the shown columns.");
             ui.label("• Click a finding to read what it means and what you can do about it.");
             ui.label("• Right-click a process to end, suspend/resume, or end it and quarantine its file. Restore from the Quarantine tab.");
+            ui.label("• Right-click a startup entry to disable or enable it, using the same switch as Task Manager. All-users entries need NtSentry running as administrator.");
             ui.label("• Find (Ctrl+F) filters the findings and the current tab by any text: name, PID, path…");
             ui.label("• Baseline > Capture baseline records ntdll on a known-clean system; later scans report only deviations from it.");
             ui.label("• Scan > ... also compares ntdll across all processes, checks loaded DLLs, and audits services, drivers and startup entries.");
@@ -2694,6 +2831,15 @@ fn describe_targets(targets: &[(ProcessIdentity, String, String, String)], paths
             }
         })
         .collect();
+    if targets.len() > 15 {
+        lines.push(format!("…and {} more", targets.len() - 15));
+    }
+    lines.join("\n")
+}
+
+/// Name and command of each startup entry for a confirmation, at most 15.
+fn describe_startup(targets: &[AutorunInfo]) -> String {
+    let mut lines: Vec<String> = targets.iter().take(15).map(|a| format!("{}\n    {}", a.name, a.command)).collect();
     if targets.len() > 15 {
         lines.push(format!("…and {} more", targets.len() - 15));
     }
@@ -2903,6 +3049,8 @@ impl eframe::App for Dashboard {
         let mut marked_pids: Vec<u32> =
             marked.iter().filter_map(|s| if let Selection::Process(p) = s { Some(*p) } else { None }).collect();
         marked_pids.sort_unstable();
+        let startup_entries = self.inventory.as_ref().filter(|_| self.tab == Tab::Startup).map_or(Vec::new(), |i| i.startup.clone());
+        let elevated = self.elevated;
         let menu = |ui: &mut egui::Ui, row: &Row| {
             let selection = &row.key;
             let targets = match selection {
@@ -2910,8 +3058,9 @@ impl eframe::App for Dashboard {
                 Selection::Process(pid) => vec![*pid],
                 _ => Vec::new(),
             };
+            let startup = startup_choices(&startup_targets(&startup_entries, selection, &marked), elevated);
             let selected = if marked.contains(selection) { marked.len() } else { 1 };
-            row_menu(ui, selection, &targets, &suspended, selected, row.has_file)
+            row_menu(ui, selection, &targets, &suspended, &startup, selected, row.has_file)
         };
         egui::CentralPanel::default().show(ui, |ui| {
             self.summary(ui);
@@ -2984,6 +3133,7 @@ impl eframe::App for Dashboard {
 mod tests {
     use super::*;
     use egui::{Pos2, Rect, pos2, vec2};
+    use ntsentry::startup_control::{Hive, RUN, Switch};
 
     /// Runs `render_table` headlessly, feeding pointer events, and returns what it reported.
     fn run_frames(
@@ -3049,6 +3199,126 @@ mod tests {
         let mut opened = menus.into_inner();
         opened.dedup();
         (selected, sorted, opened, egui::Popup::is_any_open(&ctx))
+    }
+
+    fn startup_entry(name: &str, hive: Hive, disabled: bool) -> AutorunInfo {
+        AutorunInfo {
+            location: r"HKCU\Example\Run".into(),
+            name: name.into(),
+            command: format!(r"C:\Example\{name}.exe"),
+            switch: Some(Switch { hive, group: RUN, value: name.into() }),
+            disabled,
+        }
+    }
+
+    fn startup_row(entry: &AutorunInfo) -> Selection {
+        Selection::Startup(startup_key(entry))
+    }
+
+    fn names(entries: &[AutorunInfo]) -> Vec<&str> {
+        entries.iter().map(|a| a.name.as_str()).collect()
+    }
+
+    /// Draws a row's menu headlessly, clicks its first item and returns what that asked for.
+    fn click_first_item(selection: &Selection, startup: &[StartupChoice]) -> Option<RowAction> {
+        let ctx = egui::Context::default();
+        let mut chosen = None;
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                chosen = chosen.take().or(row_menu(ui, selection, &[], &HashSet::new(), startup, 1, false));
+            });
+            output.textures_delta.clear();
+        };
+        let pos = pos2(20.0, 12.0);
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(Vec::new());
+        frame(Vec::new());
+        frame(vec![egui::Event::PointerMoved(pos)]);
+        frame(vec![button(true)]);
+        frame(vec![button(false)]);
+        frame(Vec::new());
+        chosen
+    }
+
+    #[test]
+    fn the_menu_item_of_an_enabled_entry_disables_it() {
+        let entry = startup_entry("Example App", Hive::CurrentUser, false);
+        let choices = startup_choices(std::slice::from_ref(&entry), false);
+        match click_first_item(&startup_row(&entry), &choices) {
+            Some(RowAction::SetStartup(targets, true)) => assert_eq!(names(&targets), ["Example App"]),
+            other => panic!("expected a disable action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_menu_item_of_a_disabled_entry_enables_it() {
+        let entry = startup_entry("Example App", Hive::CurrentUser, true);
+        let choices = startup_choices(std::slice::from_ref(&entry), false);
+        match click_first_item(&startup_row(&entry), &choices) {
+            Some(RowAction::SetStartup(targets, false)) => assert_eq!(names(&targets), ["Example App"]),
+            other => panic!("expected an enable action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_greyed_out_menu_item_does_nothing() {
+        let entry = startup_entry("Example App", Hive::LocalMachine, false);
+        let choices = startup_choices(std::slice::from_ref(&entry), false);
+        assert!(click_first_item(&startup_row(&entry), &choices).is_none());
+    }
+
+    #[test]
+    fn startup_choices_offer_only_what_would_change() {
+        let on = startup_entry("One", Hive::CurrentUser, false);
+        let also_on = startup_entry("Two", Hive::CurrentUser, false);
+        let off = startup_entry("Three", Hive::CurrentUser, true);
+
+        let choices = startup_choices(&[on.clone(), also_on.clone()], false);
+        assert_eq!(choices.len(), 1, "nothing to enable");
+        assert_eq!((choices[0].label.as_str(), choices[0].disable), ("Disable at startup (2 entries)…", true));
+
+        let choices = startup_choices(&[on, off], false);
+        assert_eq!(choices.len(), 2);
+        assert_eq!((choices[0].label.as_str(), names(&choices[0].targets)), ("Disable at startup…", vec!["One"]));
+        assert_eq!((choices[1].label.as_str(), names(&choices[1].targets)), ("Enable at startup…", vec!["Three"]));
+    }
+
+    #[test]
+    fn all_users_entries_need_administrator_rights() {
+        let mine = startup_entry("Mine", Hive::CurrentUser, false);
+        let shared = startup_entry("Shared", Hive::LocalMachine, false);
+        assert!(startup_choices(std::slice::from_ref(&shared), false)[0].blocked);
+        assert!(!startup_choices(std::slice::from_ref(&shared), true)[0].blocked);
+        assert!(!startup_choices(&[mine, shared], false)[0].blocked, "the per-user entry can still be changed");
+    }
+
+    #[test]
+    fn startup_actions_cover_the_selection_but_not_unswitchable_entries() {
+        let a = startup_entry("A", Hive::CurrentUser, false);
+        let b = startup_entry("B", Hive::CurrentUser, true);
+        let mut once = startup_entry("Once", Hive::CurrentUser, false);
+        once.switch = None;
+        let other = startup_entry("Other", Hive::CurrentUser, false);
+        let entries = [a.clone(), b.clone(), once.clone(), other.clone()];
+
+        let marked: HashSet<Selection> = [&a, &b, &once].into_iter().map(startup_row).collect();
+        assert_eq!(names(&startup_targets(&entries, &startup_row(&a), &marked)), ["A", "B"]);
+        assert_eq!(names(&startup_targets(&entries, &startup_row(&other), &marked)), ["Other"], "a row outside the selection acts alone");
+        assert!(startup_targets(&entries, &startup_row(&once), &HashSet::new()).is_empty());
+        assert!(startup_targets(&entries, &Selection::Process(1), &marked).is_empty());
+    }
+
+    #[test]
+    fn startup_rows_keep_their_key_when_switched() {
+        let on = startup_entry("Example App", Hive::CurrentUser, false);
+        let off = startup_entry("Example App", Hive::CurrentUser, true);
+        assert_eq!(startup_key(&on), startup_key(&off), "the selection survives the refresh after a change");
+        assert_eq!((on.status(), off.status()), ("Enabled", "Disabled"));
     }
 
     fn sample() -> (Vec<Row>, Spec) {

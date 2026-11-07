@@ -17,6 +17,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::time::UNIX_EPOCH;
+use crate::startup_control::{self, Hive, Switch};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::NetworkManagement::IpHelper::*;
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
@@ -106,6 +107,33 @@ pub struct AutorunInfo {
     pub location: String,
     pub name: String,
     pub command: String,
+    /// Where Windows keeps this entry's on/off state. None when it has none (Run
+    /// once entries, desktop.ini) or the state could not be read.
+    pub switch: Option<Switch>,
+    /// Windows skips this entry at sign-in.
+    pub disabled: bool,
+}
+
+impl AutorunInfo {
+    fn new(location: String, name: String, command: String, switch: Option<Switch>) -> Self {
+        // A state that can't be read is shown as unknown, never guessed.
+        let disabled = switch.as_ref().and_then(|s| s.is_disabled().ok());
+        let switch = switch.filter(|_| disabled.is_some());
+        AutorunInfo { location, name, command, switch, disabled: disabled.unwrap_or(false) }
+    }
+
+    pub fn status(&self) -> &'static str {
+        match (&self.switch, self.disabled) {
+            (None, _) => "Not switchable",
+            (_, true) => "Disabled",
+            (_, false) => "Enabled",
+        }
+    }
+
+    /// All-users entries keep their switch in HKLM.
+    pub fn needs_admin(&self) -> bool {
+        self.switch.as_ref().is_some_and(|s| s.hive == Hive::LocalMachine)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -716,67 +744,81 @@ fn service_state(state: u32) -> &'static str {
     }
 }
 
-/// Run/RunOnce values (both registry views, HKCU and HKLM) and the startup
-/// folders. Read-only: nothing is launched and no registry value is written.
+/// Run/RunOnce values and the startup folders, each with the state Windows keeps
+/// for it. HKCU\Software is one key in both registry views, so only HKLM is read
+/// twice. Read-only: nothing is launched and no registry value is written.
 pub fn list_autoruns() -> SystemResult<Vec<AutorunInfo>> {
     let mut output = Vec::new();
+    let sources = [
+        (HKEY_CURRENT_USER, "HKCU", Hive::CurrentUser, KEY_WOW64_64KEY, "", startup_control::RUN),
+        (HKEY_LOCAL_MACHINE, "HKLM", Hive::LocalMachine, KEY_WOW64_64KEY, " (64-bit)", startup_control::RUN),
+        (HKEY_LOCAL_MACHINE, "HKLM", Hive::LocalMachine, KEY_WOW64_32KEY, " (32-bit)", startup_control::RUN32),
+    ];
     unsafe {
-        for (root, root_name) in [(HKEY_CURRENT_USER, "HKCU"), (HKEY_LOCAL_MACHINE, "HKLM")] {
-            for (view, view_name) in [(KEY_WOW64_64KEY, "64-bit"), (KEY_WOW64_32KEY, "32-bit")] {
-                for key_name in ["Software\\Microsoft\\Windows\\CurrentVersion\\Run", "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"] {
-                    let key_path = wide(key_name);
-                    let mut key: HKEY = null_mut();
-                    if RegOpenKeyExW(root, key_path.as_ptr(), 0, KEY_READ | view, &mut key) != ERROR_SUCCESS {
-                        continue;
-                    }
-                    let mut index = 0;
-                    loop {
-                        let mut name = vec![0u16; 16384];
-                        let mut name_len = name.len() as u32;
-                        let mut data = vec![0u16; 32768];
-                        let mut data_bytes = (data.len() * 2) as u32;
-                        let mut kind = 0;
-                        let status = RegEnumValueW(
-                            key,
-                            index,
-                            name.as_mut_ptr(),
-                            &mut name_len,
-                            null(),
-                            &mut kind,
-                            data.as_mut_ptr() as _,
-                            &mut data_bytes,
-                        );
-                        if status == ERROR_NO_MORE_ITEMS {
-                            break;
-                        }
-                        if status == ERROR_SUCCESS && [REG_SZ, REG_EXPAND_SZ].contains(&kind) {
-                            output.push(AutorunInfo {
-                                location: format!("{root_name}\\{key_name} ({view_name}; enabled policy not evaluated)"),
-                                name: String::from_utf16_lossy(&name[..name_len as usize]),
-                                command: from_wide(&data[..((data_bytes as usize) / 2).min(data.len())]),
-                            });
-                        }
-                        index += 1;
-                        if index >= 100_000 {
-                            break;
-                        }
-                    }
-                    RegCloseKey(key);
+        for (root, root_name, hive, view, view_name, group) in sources {
+            // Windows has no off switch for RunOnce.
+            for (key_name, switchable) in [
+                ("Software\\Microsoft\\Windows\\CurrentVersion\\Run", true),
+                ("Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", false),
+            ] {
+                let key_path = wide(key_name);
+                let mut key: HKEY = null_mut();
+                if RegOpenKeyExW(root, key_path.as_ptr(), 0, KEY_READ | view, &mut key) != ERROR_SUCCESS {
+                    continue;
                 }
+                let mut index = 0;
+                loop {
+                    let mut name = vec![0u16; 16384];
+                    let mut name_len = name.len() as u32;
+                    let mut data = vec![0u16; 32768];
+                    let mut data_bytes = (data.len() * 2) as u32;
+                    let mut kind = 0;
+                    let status = RegEnumValueW(
+                        key,
+                        index,
+                        name.as_mut_ptr(),
+                        &mut name_len,
+                        null(),
+                        &mut kind,
+                        data.as_mut_ptr() as _,
+                        &mut data_bytes,
+                    );
+                    if status == ERROR_NO_MORE_ITEMS {
+                        break;
+                    }
+                    if status == ERROR_SUCCESS && [REG_SZ, REG_EXPAND_SZ].contains(&kind) {
+                        let name = String::from_utf16_lossy(&name[..name_len as usize]);
+                        let switch = switchable.then(|| Switch { hive, group, value: name.clone() });
+                        output.push(AutorunInfo::new(
+                            format!("{root_name}\\{key_name}{view_name}"),
+                            name,
+                            from_wide(&data[..((data_bytes as usize) / 2).min(data.len())]),
+                            switch,
+                        ));
+                    }
+                    index += 1;
+                    if index >= 100_000 {
+                        break;
+                    }
+                }
+                RegCloseKey(key);
             }
         }
     }
-    for env_name in ["APPDATA", "PROGRAMDATA"] {
+    for (env_name, hive) in [("APPDATA", Hive::CurrentUser), ("PROGRAMDATA", Hive::LocalMachine)] {
         if let Some(base) = std::env::var_os(env_name) {
             let folder = Path::new(&base).join("Microsoft\\Windows\\Start Menu\\Programs\\Startup");
             if let Ok(entries) = std::fs::read_dir(&folder) {
                 for entry in entries.flatten() {
                     if entry.file_type().map(|v| v.is_file()).unwrap_or(false) {
-                        output.push(AutorunInfo {
-                            location: folder.to_string_lossy().into(),
-                            name: entry.file_name().to_string_lossy().into(),
-                            command: entry.path().to_string_lossy().into(),
-                        });
+                        let name: String = entry.file_name().to_string_lossy().into();
+                        let switch = Switch::for_folder_file(hive, &name);
+                        output.push(AutorunInfo::new(
+                            folder.to_string_lossy().into(),
+                            name,
+                            entry.path().to_string_lossy().into(),
+                            switch,
+                        ));
                     }
                 }
             }
@@ -1120,7 +1162,9 @@ mod tests {
         assert!(file_details(&own.path).unwrap().size_bytes > 0);
         assert!(!list_services(false).unwrap().is_empty());
         assert!(!list_services(true).unwrap().is_empty());
-        list_autoruns().unwrap();
+        let autoruns = list_autoruns().unwrap();
+        let unique: std::collections::HashSet<_> = autoruns.iter().map(|a| (&a.location, &a.name, &a.command)).collect();
+        assert_eq!(unique.len(), autoruns.len(), "no startup entry is listed twice");
         list_network_connections().unwrap();
     }
 }
