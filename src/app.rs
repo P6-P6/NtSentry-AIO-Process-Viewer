@@ -340,21 +340,23 @@ struct Cell {
     strong: bool,
     /// Space for a leading icon, if this cell has one; inside, the icon once loaded.
     icon: Option<Option<egui::TextureId>>,
+    /// Bytes of `text` drawn before the icon: the tree view's indent.
+    icon_after: usize,
 }
 
 impl Cell {
     fn text(text: impl Into<String>) -> Self {
         let text = text.into();
         let sort = if text.is_empty() { SortKey::Empty } else { SortKey::Text(text.to_lowercase()) };
-        Cell { text, sort, color: None, mono: false, strong: false, icon: None }
+        Cell { text, sort, color: None, mono: false, strong: false, icon: None, icon_after: 0 }
     }
 
     fn num(text: impl Into<String>, value: f64) -> Self {
-        Cell { text: text.into(), sort: SortKey::Num(value), color: None, mono: false, strong: false, icon: None }
+        Cell { text: text.into(), sort: SortKey::Num(value), color: None, mono: false, strong: false, icon: None, icon_after: 0 }
     }
 
     fn empty() -> Self {
-        Cell { text: String::new(), sort: SortKey::Empty, color: None, mono: false, strong: false, icon: None }
+        Cell { text: String::new(), sort: SortKey::Empty, color: None, mono: false, strong: false, icon: None, icon_after: 0 }
     }
 
     /// Reserves icon space, so text stays aligned while icons load.
@@ -482,30 +484,42 @@ fn sort_by_column<T>(items: &mut [T], row: impl Fn(&T) -> &Row, (column, ascendi
 }
 
 fn cell_ui(ui: &mut egui::Ui, cell: &Cell) {
-    let mut rich = RichText::new(&cell.text);
-    if cell.mono {
-        rich = rich.monospace();
-    }
-    if cell.strong {
-        rich = rich.strong();
-    }
-    if let Some(c) = cell.color {
-        rich = rich.color(c);
-    }
-    let label = egui::Label::new(rich).truncate().selectable(false);
+    let label = |text: &str| {
+        let mut rich = RichText::new(text);
+        if cell.mono {
+            rich = rich.monospace();
+        }
+        if cell.strong {
+            rich = rich.strong();
+        }
+        if let Some(c) = cell.color {
+            rich = rich.color(c);
+        }
+        egui::Label::new(rich).truncate().selectable(false)
+    };
     let Some(icon) = cell.icon else {
-        ui.add(label);
+        ui.add(label(&cell.text));
         return;
     };
+    let (indent, text) = cell.text.split_at(cell.icon_after);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
+        if !indent.is_empty() {
+            ui.add(egui::Label::new(indent).selectable(false));
+        }
         let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(ICON_SIZE), egui::Sense::hover());
         if let Some(texture) = icon {
             let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().image(texture, rect, whole, Color32::WHITE);
         }
-        ui.add(label);
+        ui.add(label(text));
     });
+}
+
+/// The icon request for a plain file path; the quotes keep spaces in the path
+/// from being read as the start of command-line arguments.
+fn path_source(path: &str) -> String {
+    format!("\"{path}\"")
 }
 
 /// One sortable, selectable table. Rows are drawn lazily, so thousands are fine.
@@ -633,8 +647,8 @@ pub struct Dashboard {
     reports: HashMap<&'static str, ScanReport>,
     live: Option<ProcessSnapshot>,
     inventory: Option<SystemInventory>,
-    /// By startup row key; an empty slot has been requested but has no icon yet.
-    startup_icons: HashMap<String, Option<egui::TextureHandle>>,
+    /// By the command requested; an empty slot has been requested but has no icon yet.
+    icons: HashMap<String, Option<egui::TextureHandle>>,
     proc_details: Option<ProcessDetails>,
     details_requested: Option<u32>,
 
@@ -736,7 +750,7 @@ impl Dashboard {
             reports: HashMap::new(),
             live: None,
             inventory: None,
-            startup_icons: HashMap::new(),
+            icons: HashMap::new(),
             proc_details: None,
             details_requested: None,
             pending_scans: 0,
@@ -851,6 +865,7 @@ impl Dashboard {
                     ));
                     self.track_new("processes", process_inventory::MODULE, &r.findings);
                     self.process_scan = Some(r);
+                    self.request_icons();
                 }
                 Event::Report(r) => {
                     self.note(format!("{} ({} ms)", r.summary, r.duration_ms));
@@ -882,7 +897,10 @@ impl Dashboard {
                 Event::Live(result) => {
                     self.live_outstanding = false;
                     match result {
-                        Ok(snapshot) => self.live = Some(snapshot),
+                        Ok(snapshot) => {
+                            self.live = Some(snapshot);
+                            self.request_icons();
+                        }
                         Err(e) => self.note(format!("Live refresh failed: {e}")),
                     }
                 }
@@ -892,38 +910,53 @@ impl Dashboard {
                         self.note(e.clone());
                     }
                     self.inventory = Some(inv);
-                    self.request_startup_icons();
+                    self.request_icons();
                 }
                 Event::ProcessDetails(details) => {
                     if self.details_requested == Some(details.pid) {
                         self.proc_details = Some(details);
                     }
                 }
-                Event::StartupIcons(icons) => {
+                Event::Icons(icons) => {
                     for (key, image) in icons {
-                        let (Some(image), Some(slot)) = (image, self.startup_icons.get_mut(&key)) else { continue };
+                        let (Some(image), Some(slot)) = (image, self.icons.get_mut(&key)) else { continue };
                         let pixels = egui::ColorImage::from_rgba_unmultiplied(image.size, &image.rgba);
-                        *slot = Some(self.ctx.load_texture(format!("startup-icon:{key}"), pixels, egui::TextureOptions::LINEAR));
+                        *slot = Some(self.ctx.load_texture(format!("icon:{key}"), pixels, egui::TextureOptions::LINEAR));
                     }
                 }
             }
         }
     }
 
-    /// Asks for icons of startup entries not seen yet and forgets entries that are gone.
-    fn request_startup_icons(&mut self) {
-        let Some(inventory) = &self.inventory else { return };
-        let current: HashSet<String> = inventory.startup.iter().map(startup_key).collect();
-        self.startup_icons.retain(|key, _| current.contains(key));
-        let wanted: Vec<(String, String)> = inventory
-            .startup
-            .iter()
-            .map(|a| (startup_key(a), a.command.clone()))
-            .filter(|(key, _)| !self.startup_icons.contains_key(key))
-            .collect();
-        if !wanted.is_empty() && self.worker.send_live(LiveCommand::LoadStartupIcons(wanted.clone())) {
-            self.startup_icons.extend(wanted.into_iter().map(|(key, _)| (key, None)));
+    /// Every icon the inventory tabs can show, as the command that identifies its file.
+    fn icon_sources(&self) -> HashSet<String> {
+        let mut sources = HashSet::new();
+        if let Some(inventory) = &self.inventory {
+            sources.extend(inventory.services.iter().chain(&inventory.drivers).map(|s| s.binary_path.clone()));
+            sources.extend(inventory.startup.iter().map(|a| a.command.clone()));
         }
+        if let Some(live) = &self.live {
+            sources.extend(live.processes.iter().map(|p| path_source(&p.path)));
+        }
+        if let Some(scan) = &self.process_scan {
+            sources.extend(scan.processes.iter().map(|r| path_source(r.path.as_deref().unwrap_or_default())));
+        }
+        sources.extend(self.quarantine.iter().map(|q| path_source(&q.original_path)));
+        sources
+    }
+
+    /// Asks for icons not seen yet and forgets those no row uses any more.
+    fn request_icons(&mut self) {
+        let sources = self.icon_sources();
+        self.icons.retain(|source, _| sources.contains(source));
+        let wanted: Vec<String> = sources.into_iter().filter(|source| !self.icons.contains_key(source)).collect();
+        if !wanted.is_empty() && self.worker.send_icons(wanted.clone()) {
+            self.icons.extend(wanted.into_iter().map(|source| (source, None)));
+        }
+    }
+
+    fn icon_for(&self, source: &str) -> Option<egui::TextureId> {
+        self.icons.get(source).and_then(Option::as_ref).map(egui::TextureHandle::id)
     }
 
     /// Marks findings that were not in the previous scan of the same kind (the
@@ -1170,7 +1203,7 @@ impl Dashboard {
         let cells = vec![
             Cell::severity(severity),
             Cell::num(pid.to_string(), f64::from(pid)),
-            Cell::text(&name),
+            Cell::text(&name).with_icon(self.icon_for(&path_source(&path))),
             if accessible { live.map_or_else(Cell::empty, |p| Cell::num(format!("{:.1}", p.cpu_percent), p.cpu_percent)) } else { Cell::empty() },
             if accessible { live.map_or_else(Cell::empty, |p| Cell::num(format_bytes(p.memory_bytes), p.memory_bytes as f64)) } else { Cell::empty() },
             live.map_or_else(Cell::empty, |p| Cell::num(p.thread_count.to_string(), f64::from(p.thread_count))),
@@ -1235,7 +1268,7 @@ impl Dashboard {
                             key,
                             vec![
                                 Cell::severity(severity),
-                                Cell::text(&s.name),
+                                Cell::text(&s.name).with_icon(self.icon_for(&s.binary_path)),
                                 Cell::text(&s.display_name),
                                 Cell::text(&s.state),
                                 Cell::text(&s.start_type),
@@ -1255,15 +1288,13 @@ impl Dashboard {
                     .iter()
                     .map(|a| {
                         let severity = flags.get(&persistence_audit::subject(EntryKind::Startup, &a.name, &a.location)).copied();
-                        let key = startup_key(a);
-                        let icon = self.startup_icons.get(&key).and_then(Option::as_ref).map(egui::TextureHandle::id);
                         let mut row = Row::new(
-                            Selection::Startup(key),
+                            Selection::Startup(startup_key(a)),
                             vec![
                                 Cell::severity(severity),
                                 Cell::text(a.status()),
                                 Cell::text(&a.location),
-                                Cell::text(&a.name).with_icon(icon),
+                                Cell::text(&a.name).with_icon(self.icon_for(&a.command)),
                                 Cell::text(&a.command),
                             ],
                         );
@@ -1281,7 +1312,7 @@ impl Dashboard {
                         Selection::Quarantined(q.id.clone()),
                         vec![
                             Cell::num(format_utc(q.quarantined_unix), q.quarantined_unix as f64),
-                            Cell::text(file),
+                            Cell::text(file).with_icon(self.icon_for(&path_source(&q.original_path))),
                             Cell::text(&q.original_path),
                             Cell::num(format_bytes(q.size), q.size as f64),
                             Cell::text(&q.process),
@@ -1292,9 +1323,9 @@ impl Dashboard {
                 .collect(),
             Tab::Connections => {
                 let Some(inv) = &self.inventory else { return Vec::new() };
-                let names: HashMap<u32, String> = match &self.live {
-                    Some(l) => l.processes.iter().map(|p| (p.identity.pid, p.name.clone())).collect(),
-                    None => self.records_by_pid().into_iter().map(|(pid, r)| (pid, r.name.clone())).collect(),
+                let processes: HashMap<u32, (&str, &str)> = match &self.live {
+                    Some(l) => l.processes.iter().map(|p| (p.identity.pid, (p.name.as_str(), p.path.as_str()))).collect(),
+                    None => self.records_by_pid().into_iter().map(|(pid, r)| (pid, (r.name.as_str(), r.path.as_deref().unwrap_or_default()))).collect(),
                 };
                 inv.connections
                     .iter()
@@ -1307,7 +1338,9 @@ impl Dashboard {
                                 Cell::text(&c.remote_address).mono(),
                                 Cell::text(&c.state),
                                 Cell::num(c.pid.to_string(), f64::from(c.pid)),
-                                Cell::text(names.get(&c.pid).cloned().unwrap_or_default()),
+                                processes
+                                    .get(&c.pid)
+                                    .map_or_else(Cell::empty, |(name, path)| Cell::text(*name).with_icon(self.icon_for(&path_source(path)))),
                             ],
                         )
                     })
@@ -2946,7 +2979,9 @@ fn tree_order(entries: Vec<(Row, u32, u64)>) -> Vec<Row> {
         .filter_map(|(i, depth)| {
             let mut row = slots[i].take()?;
             if depth > 0 {
-                row.cells[2].text = format!("{}› {}", "    ".repeat(depth - 1), row.cells[2].text);
+                let indent = format!("{}› ", "    ".repeat(depth - 1));
+                row.cells[2].icon_after = indent.len();
+                row.cells[2].text.insert_str(0, &indent);
             }
             Some(row)
         })
@@ -3403,6 +3438,16 @@ mod tests {
         let third_row_y = (ROW_HEIGHT + 2.0) + 2.5 * (ROW_HEIGHT + 3.0);
         let (selected, _, _, _) = run_frames(&rows, &spec, &[pos2(12.0, third_row_y)], egui::PointerButton::Primary);
         assert_eq!(selected, vec![Selection::Process(3)]);
+    }
+
+    #[test]
+    fn tree_indent_stays_before_the_icon() {
+        let row = |pid| Row::new(Selection::Process(pid), vec![Cell::empty(), Cell::empty(), Cell::text(format!("p{pid}.exe")).with_icon(None)]);
+        let rows = tree_order(vec![(row(1), 0, 1), (row(2), 1, 2)]);
+        assert_eq!(rows[0].cells[2].icon_after, 0);
+        let child = &rows[1].cells[2];
+        assert_ne!(child.icon_after, 0);
+        assert_eq!(&child.text[child.icon_after..], "p2.exe");
     }
 
     #[test]

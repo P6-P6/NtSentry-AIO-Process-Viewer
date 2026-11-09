@@ -1,4 +1,4 @@
-//! Small icons for the files that startup entries run.
+//! Small icons for the files behind inventory rows.
 //!
 //! An icon is read from the file's resources with `ExtractIconExW`, which maps
 //! the file as data, so nothing from a possibly hostile program runs. Files with
@@ -98,7 +98,7 @@ fn icon_image(icon: &OwnedIcon) -> Option<IconImage> {
         return None;
     }
     let (color, mask) = (OwnedBitmap(info.hbmColor), OwnedBitmap(info.hbmMask));
-    // Monochrome icons have no color bitmap; a small startup list never needs them.
+    // Monochrome icons have no color bitmap; the row falls back to the generic icon.
     if color.0.is_null() {
         return None;
     }

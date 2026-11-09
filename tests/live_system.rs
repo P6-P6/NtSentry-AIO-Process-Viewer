@@ -119,14 +119,15 @@ fn ntdll_sweep_finds_a_fresh_child_identical() {
 }
 
 #[test]
-fn every_startup_entry_gets_an_icon() {
+fn every_inventory_entry_gets_an_icon() {
     let inv = inventory::collect();
-    let missing: Vec<&str> = inv
-        .startup
-        .iter()
-        .filter(|a| file_icon::small_icon(inventory::command_target(&a.command).as_deref()).is_none())
-        .map(|a| a.name.as_str())
-        .collect();
+    let services = inv.services.iter().chain(&inv.drivers).map(|s| s.binary_path.as_str());
+    let commands: Vec<&str> = services.chain(inv.startup.iter().map(|a| a.command.as_str())).collect();
+    assert!(!commands.is_empty());
+    let started = std::time::Instant::now();
+    let missing: Vec<&str> =
+        commands.iter().copied().filter(|c| file_icon::small_icon(inventory::command_target(c).as_deref()).is_none()).collect();
+    println!("{} icons in {:?}", commands.len(), started.elapsed());
     assert!(missing.is_empty(), "{missing:?}");
 }
 

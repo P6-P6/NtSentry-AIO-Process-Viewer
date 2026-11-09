@@ -4,6 +4,8 @@
 //! * The scan thread runs the tamper scans (seconds each) and logs them.
 //! * The live thread refreshes CPU/memory and the inventories, and loads details
 //!   for a selected process, so it never waits behind a scan.
+//! * The icon thread reads row icons, which can touch hundreds of files, some on
+//!   slow drives, so it never holds up the live refresh.
 
 use crate::file_icon::{IconImage, small_icon};
 use crate::findings::{Finding, ScanReport, Severity};
@@ -13,6 +15,7 @@ use crate::process_inventory::{self, KnownDirs, ProcessInventory, ProcessReport}
 use crate::signature::SignatureCache;
 use crate::{module_audit, persistence_audit};
 use crate::storage::DataDir;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -35,8 +38,6 @@ pub enum LiveCommand {
     RefreshProcesses,
     CollectInventory,
     ProcessDetails { identity: ProcessIdentity, path: String },
-    /// Icons for startup entries, as (row key, command).
-    LoadStartupIcons(Vec<(String, String)>),
     Act(Action),
 }
 
@@ -69,25 +70,29 @@ pub enum Event {
     Live(Result<ProcessSnapshot, String>),
     Inventory(SystemInventory),
     ProcessDetails(ProcessDetails),
-    StartupIcons(Vec<(String, Option<IconImage>)>),
+    /// Loaded icons, as (command they were requested for, icon).
+    Icons(Vec<(String, Option<IconImage>)>),
     ActionDone { ok: bool, message: String },
 }
 
 pub struct Worker {
     scans: Sender<Command>,
     live: Sender<LiveCommand>,
+    icons: Sender<Vec<String>>,
     pub events: Receiver<Event>,
 }
 
 impl Worker {
     /// `notify` is called after every event, e.g. to wake the UI with `request_repaint`.
-    /// Both threads end when the `Worker` is dropped (their command channels close).
+    /// The threads end when the `Worker` is dropped (their command channels close).
     pub fn spawn(data: DataDir, notify: impl Fn() + Send + Sync + 'static) -> Self {
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(notify);
         let (scans, scan_inbox) = channel::<Command>();
         let (live, live_inbox) = channel::<LiveCommand>();
+        let (icons, icon_inbox) = channel::<Vec<String>>();
         let (outbox, events) = channel::<Event>();
         let (scan_out, scan_notify) = (outbox.clone(), notify.clone());
+        let (icon_out, icon_notify) = (outbox.clone(), notify.clone());
         let live_data = data.clone();
         std::thread::Builder::new()
             .name("ntsentry-scan".into())
@@ -97,7 +102,11 @@ impl Worker {
             .name("ntsentry-live".into())
             .spawn(move || run_live(live_data, live_inbox, outbox, notify))
             .expect("spawn live thread");
-        Worker { scans, live, events }
+        std::thread::Builder::new()
+            .name("ntsentry-icons".into())
+            .spawn(move || run_icons(icon_inbox, icon_out, icon_notify))
+            .expect("spawn icon thread");
+        Worker { scans, live, icons, events }
     }
 
     pub fn send(&self, command: Command) -> bool {
@@ -106,6 +115,34 @@ impl Worker {
 
     pub fn send_live(&self, command: LiveCommand) -> bool {
         self.live.send(command).is_ok()
+    }
+
+    /// Requests icons for these commands; each arrives in an [`Event::Icons`].
+    pub fn send_icons(&self, commands: Vec<String>) -> bool {
+        self.icons.send(commands).is_ok()
+    }
+}
+
+/// Icons sent per event, so a long list appears progressively.
+const ICON_BATCH: usize = 32;
+
+fn run_icons(inbox: Receiver<Vec<String>>, outbox: Sender<Event>, notify: Arc<dyn Fn() + Send + Sync>) {
+    // Many commands share a file, such as every service hosted by svchost.exe.
+    let mut by_file: HashMap<Option<String>, Option<IconImage>> = HashMap::new();
+    while let Ok(commands) = inbox.recv() {
+        for batch in commands.chunks(ICON_BATCH) {
+            let icons = batch
+                .iter()
+                .map(|command| {
+                    let file = inventory::command_target(command);
+                    (command.clone(), by_file.entry(file).or_insert_with_key(|f| small_icon(f.as_deref())).clone())
+                })
+                .collect();
+            if outbox.send(Event::Icons(icons)).is_err() {
+                return;
+            }
+            notify();
+        }
     }
 }
 
@@ -249,12 +286,6 @@ fn run_live(data: DataDir, inbox: Receiver<LiveCommand>, outbox: Sender<Event>, 
             LiveCommand::ProcessDetails { identity, path } => {
                 Event::ProcessDetails(inventory::process_details(identity, &path))
             }
-            LiveCommand::LoadStartupIcons(entries) => Event::StartupIcons(
-                entries
-                    .into_iter()
-                    .map(|(key, command)| (key, small_icon(inventory::command_target(&command).as_deref())))
-                    .collect(),
-            ),
             LiveCommand::Act(action) => {
                 let (ok, message, subject) = perform(&data, action);
                 let severity = if ok { Severity::Info } else { Severity::Low };
