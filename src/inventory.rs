@@ -92,6 +92,16 @@ pub fn image_path_from_command(command: &str) -> Option<String> {
     (path.len() > 3 && path.contains('\\')).then_some(path)
 }
 
+/// The file a service or startup command runs, following a Startup-folder
+/// shortcut to the program it opens rather than the .lnk file itself.
+pub fn command_target(command: &str) -> Option<String> {
+    let path = image_path_from_command(command)?;
+    if !path.to_lowercase().ends_with(".lnk") {
+        return Some(path);
+    }
+    std::fs::read(&path).ok().and_then(|bytes| shortcut_target(&bytes))
+}
+
 /// Target path of a Windows shortcut (.lnk), from its LinkInfo block
 /// (MS-SHLLINK: LocalBasePath + CommonPathSuffix). `None` when the shortcut has
 /// no local target (e.g. a shell or network item) or is malformed.
@@ -193,9 +203,8 @@ mod tests {
         assert_eq!(image_path_from_command(""), None);
     }
 
-    #[test]
-    fn reads_shortcut_targets() {
-        // Minimal shell link: header with HasLinkInfo, LinkInfo with an ANSI local base path.
+    /// Minimal shell link: header with HasLinkInfo, LinkInfo with an ANSI local base path.
+    fn sample_shortcut() -> Vec<u8> {
         let mut lnk = vec![0u8; 0x4C];
         lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
         lnk[0x14..0x18].copy_from_slice(&0x2u32.to_le_bytes());
@@ -212,6 +221,22 @@ mod tests {
         info.extend_from_slice(base);
         info.push(0);
         lnk.extend_from_slice(&info);
+        lnk
+    }
+
+    #[test]
+    fn command_target_follows_shortcuts_only() {
+        assert_eq!(command_target(r#""C:\App\app.exe" --quiet"#).as_deref(), Some(r"C:\App\app.exe"));
+        let path = std::env::temp_dir().join(format!("ntsentry-target-{}.lnk", std::process::id()));
+        std::fs::write(&path, sample_shortcut()).unwrap();
+        let target = command_target(&format!("\"{}\"", path.display()));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(target.as_deref(), Some(r"C:\Program Files\Example App\app.exe"));
+    }
+
+    #[test]
+    fn reads_shortcut_targets() {
+        let mut lnk = sample_shortcut();
         assert_eq!(shortcut_target(&lnk).as_deref(), Some(r"C:\Program Files\Example App\app.exe"));
         assert_eq!(shortcut_target(b"not a shortcut"), None);
         lnk[0x14] = 0;

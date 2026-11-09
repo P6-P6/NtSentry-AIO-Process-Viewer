@@ -32,6 +32,7 @@ const EXTRA_SCANS: [(&str, &str); 3] = [
 ];
 
 const ROW_HEIGHT: f32 = 20.0;
+const ICON_SIZE: f32 = 16.0;
 const INVENTORY_REFRESH: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -337,21 +338,29 @@ struct Cell {
     color: Option<Color32>,
     mono: bool,
     strong: bool,
+    /// Space for a leading icon, if this cell has one; inside, the icon once loaded.
+    icon: Option<Option<egui::TextureId>>,
 }
 
 impl Cell {
     fn text(text: impl Into<String>) -> Self {
         let text = text.into();
         let sort = if text.is_empty() { SortKey::Empty } else { SortKey::Text(text.to_lowercase()) };
-        Cell { text, sort, color: None, mono: false, strong: false }
+        Cell { text, sort, color: None, mono: false, strong: false, icon: None }
     }
 
     fn num(text: impl Into<String>, value: f64) -> Self {
-        Cell { text: text.into(), sort: SortKey::Num(value), color: None, mono: false, strong: false }
+        Cell { text: text.into(), sort: SortKey::Num(value), color: None, mono: false, strong: false, icon: None }
     }
 
     fn empty() -> Self {
-        Cell { text: String::new(), sort: SortKey::Empty, color: None, mono: false, strong: false }
+        Cell { text: String::new(), sort: SortKey::Empty, color: None, mono: false, strong: false, icon: None }
+    }
+
+    /// Reserves icon space, so text stays aligned while icons load.
+    fn with_icon(mut self, icon: Option<egui::TextureId>) -> Self {
+        self.icon = Some(icon);
+        self
     }
 
     fn severity(severity: Option<Severity>) -> Self {
@@ -483,7 +492,20 @@ fn cell_ui(ui: &mut egui::Ui, cell: &Cell) {
     if let Some(c) = cell.color {
         rich = rich.color(c);
     }
-    ui.add(egui::Label::new(rich).truncate().selectable(false));
+    let label = egui::Label::new(rich).truncate().selectable(false);
+    let Some(icon) = cell.icon else {
+        ui.add(label);
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(ICON_SIZE), egui::Sense::hover());
+        if let Some(texture) = icon {
+            let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(texture, rect, whole, Color32::WHITE);
+        }
+        ui.add(label);
+    });
 }
 
 /// One sortable, selectable table. Rows are drawn lazily, so thousands are fine.
@@ -611,6 +633,8 @@ pub struct Dashboard {
     reports: HashMap<&'static str, ScanReport>,
     live: Option<ProcessSnapshot>,
     inventory: Option<SystemInventory>,
+    /// By startup row key; an empty slot has been requested but has no icon yet.
+    startup_icons: HashMap<String, Option<egui::TextureHandle>>,
     proc_details: Option<ProcessDetails>,
     details_requested: Option<u32>,
 
@@ -712,6 +736,7 @@ impl Dashboard {
             reports: HashMap::new(),
             live: None,
             inventory: None,
+            startup_icons: HashMap::new(),
             proc_details: None,
             details_requested: None,
             pending_scans: 0,
@@ -867,13 +892,37 @@ impl Dashboard {
                         self.note(e.clone());
                     }
                     self.inventory = Some(inv);
+                    self.request_startup_icons();
                 }
                 Event::ProcessDetails(details) => {
                     if self.details_requested == Some(details.pid) {
                         self.proc_details = Some(details);
                     }
                 }
+                Event::StartupIcons(icons) => {
+                    for (key, image) in icons {
+                        let (Some(image), Some(slot)) = (image, self.startup_icons.get_mut(&key)) else { continue };
+                        let pixels = egui::ColorImage::from_rgba_unmultiplied(image.size, &image.rgba);
+                        *slot = Some(self.ctx.load_texture(format!("startup-icon:{key}"), pixels, egui::TextureOptions::LINEAR));
+                    }
+                }
             }
+        }
+    }
+
+    /// Asks for icons of startup entries not seen yet and forgets entries that are gone.
+    fn request_startup_icons(&mut self) {
+        let Some(inventory) = &self.inventory else { return };
+        let current: HashSet<String> = inventory.startup.iter().map(startup_key).collect();
+        self.startup_icons.retain(|key, _| current.contains(key));
+        let wanted: Vec<(String, String)> = inventory
+            .startup
+            .iter()
+            .map(|a| (startup_key(a), a.command.clone()))
+            .filter(|(key, _)| !self.startup_icons.contains_key(key))
+            .collect();
+        if !wanted.is_empty() && self.worker.send_live(LiveCommand::LoadStartupIcons(wanted.clone())) {
+            self.startup_icons.extend(wanted.into_iter().map(|(key, _)| (key, None)));
         }
     }
 
@@ -1206,13 +1255,15 @@ impl Dashboard {
                     .iter()
                     .map(|a| {
                         let severity = flags.get(&persistence_audit::subject(EntryKind::Startup, &a.name, &a.location)).copied();
+                        let key = startup_key(a);
+                        let icon = self.startup_icons.get(&key).and_then(Option::as_ref).map(egui::TextureHandle::id);
                         let mut row = Row::new(
-                            Selection::Startup(startup_key(a)),
+                            Selection::Startup(key),
                             vec![
                                 Cell::severity(severity),
                                 Cell::text(a.status()),
                                 Cell::text(&a.location),
-                                Cell::text(&a.name),
+                                Cell::text(&a.name).with_icon(icon),
                                 Cell::text(&a.command),
                             ],
                         );
@@ -3343,6 +3394,15 @@ mod tests {
             run_frames(&rows, &spec, &[pos2(20.0, third_row_y), pos2(300.0, third_row_y)], egui::PointerButton::Primary);
         assert_eq!(selected, vec![Selection::Process(3), Selection::Process(3)], "clicks on the PID text and on the name cell");
         assert!(menus.is_empty(), "a left click opens no menu");
+    }
+
+    #[test]
+    fn clicking_an_icon_cell_selects_its_row() {
+        let (mut rows, spec) = sample();
+        rows[2].cells[0] = Cell::text("3").with_icon(None);
+        let third_row_y = (ROW_HEIGHT + 2.0) + 2.5 * (ROW_HEIGHT + 3.0);
+        let (selected, _, _, _) = run_frames(&rows, &spec, &[pos2(12.0, third_row_y)], egui::PointerButton::Primary);
+        assert_eq!(selected, vec![Selection::Process(3)]);
     }
 
     #[test]

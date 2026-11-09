@@ -16,6 +16,7 @@ pub mod driver_audit;
 pub mod eventlog;
 pub mod explain;
 pub mod export;
+pub mod file_icon;
 pub mod findings;
 pub mod integrity_monitor;
 pub mod inventory;

@@ -6,7 +6,7 @@ use ntsentry::integrity_monitor::{capture_baseline, load_baseline, ntdll_path, s
 use ntsentry::integrity_monitor::{SWEEP_MODULE, sweep_processes};
 use ntsentry::process_inventory::{KnownDirs, ProcessInventory};
 use ntsentry::signature::{SignatureCache, SignatureState, signature_info};
-use ntsentry::{inventory, module_audit, persistence_audit};
+use ntsentry::{file_icon, inventory, module_audit, persistence_audit};
 use ntsentry::storage::DataDir;
 
 struct Scratch(std::path::PathBuf);
@@ -116,6 +116,18 @@ fn ntdll_sweep_finds_a_fresh_child_identical() {
     assert!(report.summary.contains("1 processes compared"), "{}", report.summary);
     assert!(report.summary.contains("0 modified"), "{:#?}", report.findings);
     assert!(report.findings.iter().all(|f| f.module == SWEEP_MODULE && f.severity == Severity::Info));
+}
+
+#[test]
+fn every_startup_entry_gets_an_icon() {
+    let inv = inventory::collect();
+    let missing: Vec<&str> = inv
+        .startup
+        .iter()
+        .filter(|a| file_icon::small_icon(inventory::command_target(&a.command).as_deref()).is_none())
+        .map(|a| a.name.as_str())
+        .collect();
+    assert!(missing.is_empty(), "{missing:?}");
 }
 
 #[test]

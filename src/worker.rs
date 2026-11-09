@@ -5,6 +5,7 @@
 //! * The live thread refreshes CPU/memory and the inventories, and loads details
 //!   for a selected process, so it never waits behind a scan.
 
+use crate::file_icon::{IconImage, small_icon};
 use crate::findings::{Finding, ScanReport, Severity};
 use crate::integrity_monitor::{self, CaptureOutcome, IntegrityReport};
 use crate::inventory::{self, AutorunInfo, Monitor, ProcessDetails, ProcessIdentity, ProcessSnapshot, SystemInventory};
@@ -34,6 +35,8 @@ pub enum LiveCommand {
     RefreshProcesses,
     CollectInventory,
     ProcessDetails { identity: ProcessIdentity, path: String },
+    /// Icons for startup entries, as (row key, command).
+    LoadStartupIcons(Vec<(String, String)>),
     Act(Action),
 }
 
@@ -66,6 +69,7 @@ pub enum Event {
     Live(Result<ProcessSnapshot, String>),
     Inventory(SystemInventory),
     ProcessDetails(ProcessDetails),
+    StartupIcons(Vec<(String, Option<IconImage>)>),
     ActionDone { ok: bool, message: String },
 }
 
@@ -245,6 +249,12 @@ fn run_live(data: DataDir, inbox: Receiver<LiveCommand>, outbox: Sender<Event>, 
             LiveCommand::ProcessDetails { identity, path } => {
                 Event::ProcessDetails(inventory::process_details(identity, &path))
             }
+            LiveCommand::LoadStartupIcons(entries) => Event::StartupIcons(
+                entries
+                    .into_iter()
+                    .map(|(key, command)| (key, small_icon(inventory::command_target(&command).as_deref())))
+                    .collect(),
+            ),
             LiveCommand::Act(action) => {
                 let (ok, message, subject) = perform(&data, action);
                 let severity = if ok { Severity::Info } else { Severity::Low };

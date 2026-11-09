@@ -6,7 +6,7 @@
 //! The kernel's view of drivers is checked in `driver_audit`.
 
 use crate::findings::{Finding, ScanReport, Severity, sort_findings};
-use crate::inventory::{SystemInventory, image_path_from_command};
+use crate::inventory::{SystemInventory, command_target};
 use crate::process_inventory::{KnownDirs, PathClass, classify_path};
 use crate::signature::{SignatureCache, SignatureInfo, SignatureState};
 use crate::winutil::now_unix;
@@ -144,11 +144,8 @@ pub fn scan(inv: &SystemInventory, cache: &mut SignatureCache, dirs: &KnownDirs)
     let mut findings = Vec::new();
     let mut checked = 0;
     let mut evaluate = |kind: EntryKind, name: &str, location: &str, command: &str, running: bool, cache: &mut SignatureCache| {
-        let mut resolved = image_path_from_command(command);
         // Startup-folder shortcuts: judge the program they open, not the .lnk file.
-        if let Some(path) = resolved.clone().filter(|p| p.to_lowercase().ends_with(".lnk")) {
-            resolved = std::fs::read(&path).ok().and_then(|bytes| crate::inventory::shortcut_target(&bytes));
-        }
+        let resolved = command_target(command);
         let exists = resolved.as_deref().is_some_and(|f| std::path::Path::new(f).exists());
         let class = resolved.as_deref().map(|f| classify_path(f, dirs));
         // Stopped drivers are only checked for location; signatures of hundreds of
