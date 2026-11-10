@@ -13,8 +13,10 @@ use std::time::{Duration, Instant};
 use ntsentry::findings::{Finding, ScanReport, Severity};
 use ntsentry::integrity_monitor::{self, IntegrityReport};
 use ntsentry::inventory::{
-    AutorunInfo, ProcessDetails, ProcessIdentity, ProcessInfo, ProcessSnapshot, SystemInventory, image_path_from_command,
+    AutorunInfo, ConnectionTraffic, ProcessDetails, ProcessIdentity, ProcessInfo, ProcessSnapshot, ServiceInfo, SystemInventory,
+    image_path_from_command,
 };
+use ntsentry::service_control::{self, ServiceOp};
 use ntsentry::process_inventory::{self, ProcessRecord, ProcessReport};
 use ntsentry::settings::{Settings, Theme, WindowPlacement};
 use ntsentry::storage::DataDir;
@@ -34,6 +36,7 @@ const EXTRA_SCANS: [(&str, &str); 3] = [
 const ROW_HEIGHT: f32 = 20.0;
 const ICON_SIZE: f32 = 16.0;
 const INVENTORY_REFRESH: Duration = Duration::from_secs(15);
+const CONNECTIONS_REFRESH: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Tab {
@@ -170,6 +173,7 @@ enum RowAction {
     ShowAllColumns(&'static str),
     /// The entries to change, and whether to disable them.
     SetStartup(Vec<AutorunInfo>, bool),
+    Service(Vec<ServiceInfo>, ServiceOp),
 }
 
 /// A pending action shown in a confirmation dialog.
@@ -242,23 +246,118 @@ fn startup_menu_items(ui: &mut egui::Ui, choices: &[StartupChoice]) -> Option<Ro
     chosen
 }
 
+/// PIDs owning the connections an action on `selection` covers: every selected
+/// connection when the row is part of a multi-selection, else just that one.
+/// Idle and System own many rows but have no file to quarantine.
+fn connection_pids(selection: &Selection, marked: &HashSet<Selection>) -> Vec<u32> {
+    let pid_of = |s: &Selection| match s {
+        Selection::Connection(key) => key.rsplit('|').next()?.parse::<u32>().ok().filter(|p| *p != 0 && *p != 4),
+        _ => None,
+    };
+    let mut pids: Vec<u32> = if marked.len() > 1 && marked.contains(selection) {
+        marked.iter().filter_map(pid_of).collect()
+    } else {
+        pid_of(selection).into_iter().collect()
+    };
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+const SERVICE_NEEDS_ADMIN: &str = "Services and drivers can only be changed when NtSentry runs as administrator.";
+
+/// Services or drivers an action on `selection` covers: every selected one when
+/// the row is part of a multi-selection, else just that one.
+fn service_targets(entries: &[ServiceInfo], selection: &Selection, marked: &HashSet<Selection>) -> Vec<ServiceInfo> {
+    let key: fn(String) -> Selection = match selection {
+        Selection::Service(_) => Selection::Service,
+        Selection::Driver(_) => Selection::Driver,
+        _ => return Vec::new(),
+    };
+    let whole_selection = marked.len() > 1 && marked.contains(selection);
+    entries
+        .iter()
+        .filter(|s| {
+            let own = key(s.name.clone());
+            if whole_selection { marked.contains(&own) } else { own == *selection }
+        })
+        .cloned()
+        .collect()
+}
+
+/// One right-click choice for the selected services or drivers.
+struct ServiceChoice {
+    label: String,
+    op: ServiceOp,
+    /// The items this would actually act on.
+    targets: Vec<ServiceInfo>,
+    /// Why the choice is greyed out, if it is.
+    blocked: Option<&'static str>,
+}
+
+/// One choice per operation that would change at least one of `entries`.
+fn service_choices(entries: &[ServiceInfo], elevated: bool) -> Vec<ServiceChoice> {
+    [
+        (ServiceOp::Stop, "Stop"),
+        (ServiceOp::Disable, "Disable"),
+        (ServiceOp::EnableAutomatic, "Enable (automatic start)"),
+        (ServiceOp::EnableManual, "Enable (manual start)"),
+        (ServiceOp::Quarantine, "Stop, disable and quarantine file"),
+    ]
+    .into_iter()
+    .filter_map(|(op, text)| {
+        let relevant: Vec<&ServiceInfo> = entries.iter().filter(|s| service_control::applies(op, s)).collect();
+        let first = relevant.first()?;
+        let targets: Vec<ServiceInfo> =
+            relevant.iter().filter(|s| service_control::refusal(op, s).is_none()).map(|s| (*s).clone()).collect();
+        let blocked = if !elevated {
+            Some(SERVICE_NEEDS_ADMIN)
+        } else if targets.is_empty() {
+            service_control::refusal(op, first)
+        } else {
+            None
+        };
+        let label = if targets.len() > 1 { format!("{text} ({} items)…", targets.len()) } else { format!("{text}…") };
+        Some(ServiceChoice { label, op, targets, blocked })
+    })
+    .collect()
+}
+
+/// Menu items for the choices; returns what was clicked.
+fn service_menu_items(ui: &mut egui::Ui, choices: &[ServiceChoice]) -> Option<RowAction> {
+    let mut chosen = None;
+    for choice in choices {
+        let item = ui.add_enabled(choice.blocked.is_none(), egui::Button::new(&choice.label));
+        if item.on_disabled_hover_text(choice.blocked.unwrap_or_default()).clicked() {
+            chosen = Some(RowAction::Service(choice.targets.clone(), choice.op));
+        }
+    }
+    chosen
+}
+
 /// Right-click menu for a row. `targets` are the PIDs a process action applies to
 /// (all selected processes when the row is part of a multi-selection); `suspended`
-/// holds PIDs the dashboard suspended; `startup` holds the choices for a startup
-/// row; `selected` is how many rows are selected; `has_file` says whether a process
-/// or finding row points at a file.
+/// holds PIDs the dashboard suspended; `startup` and `services` hold the choices
+/// for a startup, service or driver row; `selected` is how many rows are selected;
+/// `has_file` says whether a process or finding row points at a file.
+#[allow(clippy::too_many_arguments)]
 fn row_menu(
     ui: &mut egui::Ui,
     selection: &Selection,
     targets: &[u32],
     suspended: &HashSet<u32>,
     startup: &[StartupChoice],
+    services: &[ServiceChoice],
     selected: usize,
     has_file: bool,
 ) -> Option<RowAction> {
     let mut chosen = None;
     if !startup.is_empty() {
         chosen = startup_menu_items(ui, startup);
+        ui.separator();
+    }
+    if !services.is_empty() {
+        chosen = service_menu_items(ui, services);
         ui.separator();
     }
     if matches!(selection, Selection::Process(_)) && !targets.is_empty() {
@@ -277,6 +376,16 @@ fn row_menu(
             chosen = Some(RowAction::Resume(targets.to_vec()));
         }
         if ui.button(label("End and quarantine file…")).clicked() {
+            chosen = Some(RowAction::Quarantine(targets.to_vec()));
+        }
+        ui.separator();
+    }
+    if matches!(selection, Selection::Connection(_)) && !targets.is_empty() {
+        let label = match targets.len() {
+            1 => "End owning process and quarantine file…".to_string(),
+            n => format!("End owning processes and quarantine files ({n} processes)…"),
+        };
+        if ui.button(label).clicked() {
             chosen = Some(RowAction::Quarantine(targets.to_vec()));
         }
         ui.separator();
@@ -455,6 +564,10 @@ fn format_bytes(bytes: u64) -> String {
         unit += 1;
     }
     if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
+}
+
+fn format_rate(bytes_per_second: f64) -> String {
+    format!("{}/s", format_bytes(bytes_per_second as u64))
 }
 
 /// `20261103-015452` (UTC) for default export file names.
@@ -657,9 +770,11 @@ pub struct Dashboard {
     current: Option<&'static str>,
     live_outstanding: bool,
     inventory_outstanding: bool,
+    connections_outstanding: bool,
     last_scheduled: Instant,
     last_live: Instant,
     last_inventory: Instant,
+    last_connections: Instant,
 
     // New-finding tracking
     known: HashMap<&'static str, HashSet<String>>,
@@ -707,7 +822,9 @@ pub struct Dashboard {
 impl Dashboard {
     pub fn new(cc: &eframe::CreationContext<'_>, data: DataDir, start_minimized: bool) -> Self {
         let ctx = cc.egui_ctx.clone();
-        let (settings, warning) = Settings::load(&data);
+        let (mut settings, warning) = Settings::load(&data);
+        // Pausing lasts for the session; every launch starts live.
+        settings.live_refresh = true;
         theme::install_fonts(&ctx);
         theme::apply(&ctx, settings.theme);
         let last_ctx_zoom = ctx.zoom_factor();
@@ -757,9 +874,11 @@ impl Dashboard {
             current: None,
             live_outstanding: false,
             inventory_outstanding: false,
+            connections_outstanding: false,
             last_scheduled: Instant::now(),
             last_live: long_ago,
             last_inventory: long_ago,
+            last_connections: long_ago,
             known,
             new_keys: HashSet::new(),
             alert: None,
@@ -832,6 +951,7 @@ impl Dashboard {
     fn refresh_now(&mut self) {
         self.last_live = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
         self.last_inventory = self.last_live;
+        self.last_connections = self.last_live;
     }
 
     // ----------------------------------------------------------------- events
@@ -911,6 +1031,17 @@ impl Dashboard {
                     }
                     self.inventory = Some(inv);
                     self.request_icons();
+                }
+                Event::Connections(result) => {
+                    self.connections_outstanding = false;
+                    match result {
+                        Ok(connections) => {
+                            if let Some(inv) = &mut self.inventory {
+                                inv.connections = connections;
+                            }
+                        }
+                        Err(e) => self.note(format!("Connection refresh failed: {e}")),
+                    }
                 }
                 Event::ProcessDetails(details) => {
                     if self.details_requested == Some(details.pid) {
@@ -1139,6 +1270,10 @@ impl Dashboard {
                     ("Remote address", Column::initial(200.0)),
                     ("State", Column::initial(110.0)),
                     ("PID", Column::initial(60.0)),
+                    ("Download", Column::initial(90.0)),
+                    ("Upload", Column::initial(90.0)),
+                    ("Total download", Column::initial(105.0)),
+                    ("Total upload", Column::initial(95.0)),
                     ("Process", Column::remainder()),
                 ],
             },
@@ -1330,6 +1465,12 @@ impl Dashboard {
                 inv.connections
                     .iter()
                     .map(|c| {
+                        let rate = |pick: fn(&ConnectionTraffic) -> f64| {
+                            c.traffic.as_ref().map_or_else(Cell::empty, |t| Cell::num(format_rate(pick(t)), pick(t)))
+                        };
+                        let total = |pick: fn(&ConnectionTraffic) -> u64| {
+                            c.traffic.as_ref().map_or_else(Cell::empty, |t| Cell::num(format_bytes(pick(t)), pick(t) as f64))
+                        };
                         Row::new(
                             Selection::Connection(connection_key(c)),
                             vec![
@@ -1338,6 +1479,10 @@ impl Dashboard {
                                 Cell::text(&c.remote_address).mono(),
                                 Cell::text(&c.state),
                                 Cell::num(c.pid.to_string(), f64::from(c.pid)),
+                                rate(|t| t.down_per_sec),
+                                rate(|t| t.up_per_sec),
+                                total(|t| t.total_down),
+                                total(|t| t.total_up),
                                 processes
                                     .get(&c.pid)
                                     .map_or_else(Cell::empty, |(name, path)| Cell::text(*name).with_icon(self.icon_for(&path_source(path)))),
@@ -1415,6 +1560,13 @@ impl Dashboard {
     fn startup_choices_for(&self, selection: &Selection) -> Vec<StartupChoice> {
         let entries = self.inventory.as_ref().map_or(&[][..], |i| i.startup.as_slice());
         startup_choices(&startup_targets(entries, selection, &self.marked), self.elevated)
+    }
+
+    /// Service controls for `selection`; empty unless it is a service or driver row.
+    fn service_choices_for(&self, selection: &Selection) -> Vec<ServiceChoice> {
+        let Some(inv) = &self.inventory else { return Vec::new() };
+        let entries = if matches!(selection, Selection::Driver(_)) { &inv.drivers } else { &inv.services };
+        service_choices(&service_targets(entries, selection, &self.marked), self.elevated)
     }
 
     /// PIDs a process action on `selection` applies to: every selected process
@@ -1589,6 +1741,53 @@ impl Dashboard {
                     actions: targets.into_iter().map(|entry| Action::SetStartup { entry, disable }).collect(),
                 });
             }
+            RowAction::Service(targets, op) => {
+                if targets.is_empty() {
+                    return;
+                }
+                let subject = match targets.as_slice() {
+                    [item] => item.name.clone(),
+                    items => format!("{} items", items.len()),
+                };
+                let (title, effect, button) = match op {
+                    ServiceOp::Stop => (
+                        format!("Stop {subject}?"),
+                        "Windows stops this now. Programs or hardware that depend on it may stop working. \
+                         If it is set to start automatically, it comes back at the next restart.",
+                        "Stop",
+                    ),
+                    ServiceOp::Disable => (
+                        format!("Disable {subject}?"),
+                        "Windows will not start this again, including after a restart. Anything already running keeps \
+                         running until it is stopped. Programs or hardware that depend on it may stop working, and some \
+                         drivers are needed for Windows to start properly. You can enable it again here.",
+                        "Disable",
+                    ),
+                    ServiceOp::EnableAutomatic => (
+                        format!("Set {subject} to start automatically?"),
+                        "Windows starts this at every restart. It is not started right now.",
+                        "Enable",
+                    ),
+                    ServiceOp::EnableManual => (
+                        format!("Set {subject} to start on demand?"),
+                        "Windows or a program can start this when needed. It is not started right now.",
+                        "Enable",
+                    ),
+                    ServiceOp::Quarantine => (
+                        format!("Stop, disable and quarantine {subject}?"),
+                        "Each item is stopped and set to Disabled, then its file is moved into quarantine (verified copy, \
+                         original deleted). Microsoft's own files are refused, and if an item cannot be stopped nothing \
+                         changes for it. To undo, restore the file from the Quarantine tab and enable the item again.",
+                        "Stop and quarantine",
+                    ),
+                };
+                self.confirm = Some(Confirm {
+                    title,
+                    text: format!("{}\n\n{effect}", describe_services(&targets)),
+                    button,
+                    actions: targets.into_iter().map(|target| Action::Service { target, op }).collect(),
+                });
+            }
         }
     }
 
@@ -1639,7 +1838,7 @@ impl Dashboard {
         if let Some(column) = out.sort_clicked {
             let spec = Self::spec_for(spec_id);
             // Usage columns start with the largest value, like Task Manager.
-            let largest_first = spec.as_ref().is_some_and(|s| matches!(s.columns[column].0, "CPU %" | "Memory" | "Threads" | "Size"));
+            let largest_first = spec.as_ref().is_some_and(|s| matches!(s.columns[column].0, "CPU %" | "Memory" | "Threads" | "Size" | "Download" | "Upload" | "Total download" | "Total upload"));
             let ascending = match self.sorts.get(spec_id) {
                 Some(&(current, ascending)) if current == column => !ascending,
                 _ => !largest_first,
@@ -1987,7 +2186,7 @@ impl Dashboard {
                     ("Display name", s.display_name.clone()),
                     ("State", s.state.clone()),
                     ("Start type", s.start_type.clone()),
-                    ("Image path (as registered)", s.binary_path.clone()),
+                    ("Image path", s.binary_path.clone()),
                     ("Resolved file", image_path_from_command(&s.binary_path).unwrap_or_default()),
                 ];
                 if s.pid != 0 {
@@ -2199,6 +2398,17 @@ impl Dashboard {
                     let button = theme::button_enabled(ui, !choice.blocked, egui::Button::new(&choice.label));
                     if button.on_disabled_hover_text(NEEDS_ADMIN).clicked() {
                         self.apply_row_action(RowAction::SetStartup(choice.targets, choice.disable));
+                    }
+                }
+            });
+        }
+        let services = self.service_choices_for(&selection);
+        if !services.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for choice in services {
+                    let button = theme::button_enabled(ui, choice.blocked.is_none(), egui::Button::new(&choice.label));
+                    if button.on_disabled_hover_text(choice.blocked.unwrap_or_default()).clicked() {
+                        self.apply_row_action(RowAction::Service(choice.targets, choice.op));
                     }
                 }
             });
@@ -2448,6 +2658,14 @@ impl Dashboard {
                 if !startup.is_empty() {
                     ui.separator();
                     if let Some(action) = startup_menu_items(ui, &startup) {
+                        self.apply_row_action(action);
+                        ui.close();
+                    }
+                }
+                let services = self.selected.as_ref().map(|s| self.service_choices_for(s)).unwrap_or_default();
+                if !services.is_empty() {
+                    ui.separator();
+                    if let Some(action) = service_menu_items(ui, &services) {
                         self.apply_row_action(action);
                         ui.close();
                     }
@@ -2921,6 +3139,15 @@ fn describe_targets(targets: &[(ProcessIdentity, String, String, String)], paths
     lines.join("\n")
 }
 
+/// Name and image path of each service or driver for a confirmation, at most 15.
+fn describe_services(targets: &[ServiceInfo]) -> String {
+    let mut lines: Vec<String> = targets.iter().take(15).map(|s| format!("{}\n    {}", s.name, s.binary_path)).collect();
+    if targets.len() > 15 {
+        lines.push(format!("…and {} more", targets.len() - 15));
+    }
+    lines.join("\n")
+}
+
 /// Name and command of each startup entry for a confirmation, at most 15.
 fn describe_startup(targets: &[AutorunInfo]) -> String {
     let mut lines: Vec<String> = targets.iter().take(15).map(|a| format!("{}\n    {}", a.name, a.command)).collect();
@@ -3049,17 +3276,35 @@ impl eframe::App for Dashboard {
             self.note("Scheduled scan");
             self.scan_all();
         }
-        if (!minimized && self.settings.live_refresh) || self.live.is_none() {
-            if !self.live_outstanding && self.last_live.elapsed() >= self.settings.live_interval() {
-                self.live_outstanding = self.worker.send_live(LiveCommand::RefreshProcesses);
-                self.last_live = Instant::now();
-            }
+        let live_wanted = (!minimized && self.settings.live_refresh) || self.live.is_none();
+        // The Connections tab stays live even with live refresh paused; its rows
+        // also need current processes to name their owners.
+        let watching_connections = !minimized && self.tab == Tab::Connections;
+        if (live_wanted || watching_connections) && !self.live_outstanding && self.last_live.elapsed() >= self.settings.live_interval() {
+            self.live_outstanding = self.worker.send_live(LiveCommand::RefreshProcesses);
+            self.last_live = Instant::now();
+        }
+        if live_wanted {
             if !self.inventory_outstanding && self.last_inventory.elapsed() >= INVENTORY_REFRESH {
                 self.inventory_outstanding = self.worker.send_live(LiveCommand::CollectInventory);
                 self.last_inventory = Instant::now();
             }
         } else if !self.settings.live_refresh && !minimized && self.inventory.is_none() && !self.inventory_outstanding {
             self.inventory_outstanding = self.worker.send_live(LiveCommand::CollectInventory);
+        }
+        let connections_every = if watching_connections {
+            Some(CONNECTIONS_REFRESH)
+        } else if !minimized && self.settings.live_refresh {
+            Some(self.settings.live_interval())
+        } else {
+            None
+        };
+        if let Some(every) = connections_every
+            && !self.connections_outstanding
+            && self.last_connections.elapsed() >= every
+        {
+            self.connections_outstanding = self.worker.send_live(LiveCommand::RefreshConnections);
+            self.last_connections = Instant::now();
         }
 
         if self.settings != self.saved_settings {
@@ -3136,17 +3381,24 @@ impl eframe::App for Dashboard {
             marked.iter().filter_map(|s| if let Selection::Process(p) = s { Some(*p) } else { None }).collect();
         marked_pids.sort_unstable();
         let startup_entries = self.inventory.as_ref().filter(|_| self.tab == Tab::Startup).map_or(Vec::new(), |i| i.startup.clone());
+        let service_entries = self.inventory.as_ref().map_or(Vec::new(), |i| match self.tab {
+            Tab::Services => i.services.clone(),
+            Tab::Drivers => i.drivers.clone(),
+            _ => Vec::new(),
+        });
         let elevated = self.elevated;
         let menu = |ui: &mut egui::Ui, row: &Row| {
             let selection = &row.key;
             let targets = match selection {
                 Selection::Process(_) if marked_pids.len() > 1 && marked.contains(selection) => marked_pids.clone(),
                 Selection::Process(pid) => vec![*pid],
+                Selection::Connection(_) => connection_pids(selection, &marked),
                 _ => Vec::new(),
             };
             let startup = startup_choices(&startup_targets(&startup_entries, selection, &marked), elevated);
+            let services = service_choices(&service_targets(&service_entries, selection, &marked), elevated);
             let selected = if marked.contains(selection) { marked.len() } else { 1 };
-            row_menu(ui, selection, &targets, &suspended, &startup, selected, row.has_file)
+            row_menu(ui, selection, &targets, &suspended, &startup, &services, selected, row.has_file)
         };
         egui::CentralPanel::default().show(ui, |ui| {
             self.summary(ui);
@@ -3307,6 +3559,10 @@ mod tests {
 
     /// Draws a row's menu headlessly, clicks its first item and returns what that asked for.
     fn click_first_item(selection: &Selection, startup: &[StartupChoice]) -> Option<RowAction> {
+        click_first_item_for(selection, &[], startup)
+    }
+
+    fn click_first_item_for(selection: &Selection, targets: &[u32], startup: &[StartupChoice]) -> Option<RowAction> {
         let ctx = egui::Context::default();
         let mut chosen = None;
         let mut frame = |events: Vec<egui::Event>| {
@@ -3316,7 +3572,7 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input, |ui| {
-                chosen = chosen.take().or(row_menu(ui, selection, &[], &HashSet::new(), startup, 1, false));
+                chosen = chosen.take().or(row_menu(ui, selection, targets, &HashSet::new(), startup, &[], 1, false));
             });
             output.textures_delta.clear();
         };
@@ -3329,6 +3585,28 @@ mod tests {
         frame(vec![button(false)]);
         frame(Vec::new());
         chosen
+    }
+
+    #[test]
+    fn a_connections_menu_quarantines_its_owning_process() {
+        let row = Selection::Connection("TCP4|10.0.0.2:5000|1.2.3.4:443|Established|4242".into());
+        let targets = connection_pids(&row, &HashSet::new());
+        assert_eq!(targets, [4242]);
+        match click_first_item_for(&row, &targets, &[]) {
+            Some(RowAction::Quarantine(pids)) => assert_eq!(pids, [4242]),
+            other => panic!("expected a quarantine action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_quarantine_skips_system_rows_and_repeated_owners() {
+        let key = |local: &str, pid: u32| Selection::Connection(format!("TCP4|{local}|1.2.3.4:443|Established|{pid}"));
+        for pid in [0, 4] {
+            assert!(connection_pids(&key("a:1", pid), &HashSet::new()).is_empty());
+        }
+        let marked: HashSet<Selection> = [key("a:1", 700), key("a:2", 700), key("a:3", 900), key("a:4", 0)].into_iter().collect();
+        assert_eq!(connection_pids(&key("a:1", 700), &marked), [700, 900]);
+        assert_eq!(connection_pids(&key("b:9", 800), &marked), [800], "a row outside the selection acts alone");
     }
 
     #[test]

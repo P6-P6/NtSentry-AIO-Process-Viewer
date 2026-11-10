@@ -98,6 +98,7 @@ When enabled, new findings go to the Application log under source `NtSentry`, ev
 | `src/module_audit.rs` | Unsigned DLLs in signed processes |
 | `src/eventlog.rs` | Opt-in Application event log output |
 | `src/quarantine.rs` | Restorable quarantine |
+| `src/service_control.rs` | Confirmed stop, disable, enable and quarantine for services and drivers, with their refusal rules |
 | `src/tray.rs` | Notification-area icon and the window icon |
 | `src/explain.rs` | Plain-English help for each kind of finding |
 | `assets/` | Icon (`make_icons.py` regenerates it) and the Windows resource script |

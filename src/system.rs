@@ -16,11 +16,11 @@ use std::mem::{size_of, zeroed};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use crate::startup_control::{self, Hive, Switch};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::NetworkManagement::IpHelper::*;
-use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0};
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -102,6 +102,20 @@ pub struct ServiceInfo {
     pub service_type: u32,
 }
 
+impl ServiceInfo {
+    pub fn is_driver(&self) -> bool {
+        self.service_type & SERVICE_DRIVER != 0
+    }
+}
+
+/// The start types NtSentry can set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceStart {
+    Automatic,
+    Manual,
+    Disabled,
+}
+
 #[derive(Clone, Debug)]
 pub struct AutorunInfo {
     pub location: String,
@@ -143,6 +157,17 @@ pub struct NetworkConnection {
     pub remote_address: String,
     pub state: String,
     pub pid: u32,
+    /// Measured TCP traffic; `None` for UDP, idle states and unprivileged runs.
+    pub traffic: Option<ConnectionTraffic>,
+}
+
+/// Bytes moved by one TCP connection. Totals count from when it was first measured.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConnectionTraffic {
+    pub down_per_sec: f64,
+    pub up_per_sec: f64,
+    pub total_down: u64,
+    pub total_up: u64,
 }
 
 struct OwnedHandle(HANDLE);
@@ -704,7 +729,7 @@ pub fn list_services(drivers: bool) -> SystemResult<Vec<ServiceInfo>> {
                         let mut data = vec![0u64; (size as usize).div_ceil(8)];
                         if QueryServiceConfigW(service.0, data.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW, (data.len() * 8) as u32, &mut size) != 0 {
                             let config = &*(data.as_ptr() as *const QUERY_SERVICE_CONFIGW);
-                            item.binary_path = wide_ptr(config.lpBinaryPathName);
+                            item.binary_path = effective_binary_path(wide_ptr(config.lpBinaryPathName), &name, item.service_type);
                             item.start_type = match config.dwStartType {
                                 SERVICE_BOOT_START => "Boot",
                                 SERVICE_SYSTEM_START => "System",
@@ -728,6 +753,109 @@ pub fn list_services(drivers: bool) -> SystemResult<Vec<ServiceInfo>> {
         }
         output.sort_by_key(|s| s.display_name.to_lowercase());
         Ok(output)
+    }
+}
+
+/// A driver registered without a path loads from Windows' default location.
+fn effective_binary_path(registered: String, name: &str, service_type: u32) -> String {
+    if registered.trim().is_empty() && service_type & SERVICE_DRIVER != 0 {
+        format!(r"\SystemRoot\System32\drivers\{name}.sys")
+    } else {
+        registered
+    }
+}
+
+/// How long [`stop_service`] waits for Windows to report the item stopped.
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long [`stop_service`] then waits for a service's own process to exit.
+const SERVICE_EXIT_TIMEOUT_MS: u32 = 5000;
+
+/// The manager handle comes back too, so it outlives the service handle.
+unsafe fn open_service(name: &str, access: u32) -> SystemResult<(ServiceHandle, ServiceHandle)> {
+    unsafe {
+        let manager = OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT);
+        if manager.is_null() {
+            return Err(last_error("OpenSCManager"));
+        }
+        let manager = ServiceHandle(manager);
+        let name_w = wide(name);
+        let service = OpenServiceW(manager.0, name_w.as_ptr(), access);
+        if service.is_null() {
+            return Err(last_error(&format!("Open {name}")));
+        }
+        Ok((manager, ServiceHandle(service)))
+    }
+}
+
+unsafe fn service_status(service: &ServiceHandle) -> SystemResult<SERVICE_STATUS_PROCESS> {
+    unsafe {
+        let mut status: SERVICE_STATUS_PROCESS = zeroed();
+        let mut needed = 0;
+        let ok = QueryServiceStatusEx(service.0, SC_STATUS_PROCESS_INFO, (&raw mut status).cast(), size_of_val(&status) as u32, &mut needed);
+        if ok == 0 { Err(last_error("Query service status")) } else { Ok(status) }
+    }
+}
+
+/// Stops a service or driver and waits until Windows reports it stopped. A
+/// service in its own process is also given time to exit, so its file is free.
+pub fn stop_service(name: &str) -> SystemResult<()> {
+    unsafe {
+        let (_manager, service) = open_service(name, SERVICE_STOP | SERVICE_QUERY_STATUS)?;
+        let before = service_status(&service)?;
+        if before.dwCurrentState == SERVICE_STOPPED {
+            return Ok(());
+        }
+        if before.dwCurrentState != SERVICE_STOP_PENDING {
+            let mut status: SERVICE_STATUS = zeroed();
+            if ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) == 0 {
+                let error = GetLastError();
+                if error != ERROR_SERVICE_NOT_ACTIVE {
+                    return Err(format!("Stop {name}: {}", std::io::Error::from_raw_os_error(error as i32)));
+                }
+            }
+        }
+        let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
+        while service_status(&service)?.dwCurrentState != SERVICE_STOPPED {
+            if Instant::now() >= deadline {
+                return Err(format!("{name} did not stop within {} seconds", SERVICE_STOP_TIMEOUT.as_secs()));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if before.dwProcessId != 0 && before.dwServiceType & SERVICE_WIN32_OWN_PROCESS != 0 {
+            // A process that is already gone cannot be opened, which is fine.
+            let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, before.dwProcessId);
+            if !process.is_null() {
+                let process = OwnedHandle(process);
+                WaitForSingleObject(process.0, SERVICE_EXIT_TIMEOUT_MS);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Changes only the start type of a service or driver.
+pub fn set_service_start(name: &str, start: ServiceStart) -> SystemResult<()> {
+    let start_type = match start {
+        ServiceStart::Automatic => SERVICE_AUTO_START,
+        ServiceStart::Manual => SERVICE_DEMAND_START,
+        ServiceStart::Disabled => SERVICE_DISABLED,
+    };
+    unsafe {
+        let (_manager, service) = open_service(name, SERVICE_CHANGE_CONFIG)?;
+        let ok = ChangeServiceConfigW(
+            service.0,
+            SERVICE_NO_CHANGE,
+            start_type,
+            SERVICE_NO_CHANGE,
+            null(),
+            null(),
+            null_mut(),
+            null(),
+            null(),
+            null(),
+            null(),
+        );
+        if ok == 0 { Err(last_error(&format!("Change {name}"))) } else { Ok(()) }
     }
 }
 
@@ -862,9 +990,164 @@ fn ipv6(value: [u8; 16], scope: u32, port_value: u32) -> String {
     }
 }
 
+/// Shorter gaps between samples keep the previous rate, since a tiny window
+/// would turn one burst into a wild number.
+const MIN_RATE_WINDOW_SECS: f64 = 0.2;
+
+struct Flow {
+    down: u64,
+    up: u64,
+    at: Instant,
+    down_rate: f64,
+    up_rate: f64,
+    generation: u64,
+}
+
+impl Flow {
+    fn advance(&mut self, down: u64, up: u64, now: Instant, generation: u64) -> ConnectionTraffic {
+        self.generation = generation;
+        let elapsed = now.duration_since(self.at).as_secs_f64();
+        if elapsed >= MIN_RATE_WINDOW_SECS {
+            self.down_rate = down.saturating_sub(self.down) as f64 / elapsed;
+            self.up_rate = up.saturating_sub(self.up) as f64 / elapsed;
+            self.down = down;
+            self.up = up;
+            self.at = now;
+        }
+        ConnectionTraffic { down_per_sec: self.down_rate, up_per_sec: self.up_rate, total_down: down, total_up: up }
+    }
+}
+
+/// Windows TCP states that can still carry data (Established through Last ACK).
+fn tcp_state_carries_data(state: u32) -> bool {
+    (5..=10).contains(&state)
+}
+
+/// Turns on the per-connection counters when `enable` is set, then reads
+/// (bytes in, bytes out). Windows requires elevation to turn them on.
+unsafe fn read_tcp4_counters(row: &MIB_TCPROW_LH, enable: bool) -> Option<(u64, u64)> {
+    unsafe {
+        if enable {
+            let rw = TCP_ESTATS_DATA_RW_v0 { EnableCollection: 1 };
+            let status = SetPerTcpConnectionEStats(row, TcpConnectionEstatsData, (&raw const rw).cast(), 0, size_of_val(&rw) as u32, 0);
+            if status != ERROR_SUCCESS {
+                return None;
+            }
+        }
+        let mut rod: TCP_ESTATS_DATA_ROD_v0 = zeroed();
+        let status = GetPerTcpConnectionEStats(
+            row,
+            TcpConnectionEstatsData,
+            null_mut(),
+            0,
+            0,
+            null_mut(),
+            0,
+            0,
+            (&raw mut rod).cast(),
+            0,
+            size_of_val(&rod) as u32,
+        );
+        (status == ERROR_SUCCESS).then_some((rod.DataBytesIn, rod.DataBytesOut))
+    }
+}
+
+/// The IPv6 twin of [`read_tcp4_counters`].
+unsafe fn read_tcp6_counters(row: &MIB_TCP6ROW, enable: bool) -> Option<(u64, u64)> {
+    unsafe {
+        if enable {
+            let rw = TCP_ESTATS_DATA_RW_v0 { EnableCollection: 1 };
+            let status = SetPerTcp6ConnectionEStats(row, TcpConnectionEstatsData, (&raw const rw).cast(), 0, size_of_val(&rw) as u32, 0);
+            if status != ERROR_SUCCESS {
+                return None;
+            }
+        }
+        let mut rod: TCP_ESTATS_DATA_ROD_v0 = zeroed();
+        let status = GetPerTcp6ConnectionEStats(
+            row,
+            TcpConnectionEstatsData,
+            null_mut(),
+            0,
+            0,
+            null_mut(),
+            0,
+            0,
+            (&raw mut rod).cast(),
+            0,
+            size_of_val(&rod) as u32,
+        );
+        (status == ERROR_SUCCESS).then_some((rod.DataBytesIn, rod.DataBytesOut))
+    }
+}
+
+/// Tracks TCP byte counters between listings to work out transfer rates.
+#[derive(Default)]
+pub struct TrafficMeter {
+    flows: HashMap<(String, String, u32), Flow>,
+    generation: u64,
+}
+
+impl TrafficMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The connection list with traffic filled in. A connection that left the
+    /// data-carrying states is forgotten, so a reused address pair starts fresh.
+    pub fn list(&mut self) -> SystemResult<Vec<NetworkConnection>> {
+        self.generation += 1;
+        let output = connections(Some(self))?;
+        let generation = self.generation;
+        self.flows.retain(|_, flow| flow.generation == generation);
+        Ok(output)
+    }
+
+    fn sample(&mut self, key: (String, String, u32), read: impl FnOnce(bool) -> Option<(u64, u64)>) -> Option<ConnectionTraffic> {
+        let (down, up) = read(!self.flows.contains_key(&key))?;
+        let now = Instant::now();
+        let generation = self.generation;
+        let flow = self.flows.entry(key).or_insert(Flow { down, up, at: now, down_rate: 0.0, up_rate: 0.0, generation });
+        Some(flow.advance(down, up, now, generation))
+    }
+
+    fn sample_v4(&mut self, r: &MIB_TCPROW_OWNER_PID, local: &str, remote: &str) -> Option<ConnectionTraffic> {
+        if !tcp_state_carries_data(r.dwState) {
+            return None;
+        }
+        let row = MIB_TCPROW_LH {
+            Anonymous: MIB_TCPROW_LH_0 { dwState: r.dwState },
+            dwLocalAddr: r.dwLocalAddr,
+            dwLocalPort: r.dwLocalPort,
+            dwRemoteAddr: r.dwRemoteAddr,
+            dwRemotePort: r.dwRemotePort,
+        };
+        self.sample((local.into(), remote.into(), r.dwOwningPid), |enable| unsafe { read_tcp4_counters(&row, enable) })
+    }
+
+    fn sample_v6(&mut self, r: &MIB_TCP6ROW_OWNER_PID, local: &str, remote: &str) -> Option<ConnectionTraffic> {
+        if !tcp_state_carries_data(r.dwState) {
+            return None;
+        }
+        let row = MIB_TCP6ROW {
+            State: r.dwState as MIB_TCP_STATE,
+            LocalAddr: IN6_ADDR { u: IN6_ADDR_0 { Byte: r.ucLocalAddr } },
+            dwLocalScopeId: r.dwLocalScopeId,
+            dwLocalPort: r.dwLocalPort,
+            RemoteAddr: IN6_ADDR { u: IN6_ADDR_0 { Byte: r.ucRemoteAddr } },
+            dwRemoteScopeId: r.dwRemoteScopeId,
+            dwRemotePort: r.dwRemotePort,
+        };
+        self.sample((local.into(), remote.into(), r.dwOwningPid), |enable| unsafe { read_tcp6_counters(&row, enable) })
+    }
+}
+
 /// TCP and UDP endpoints with their owning PID, IPv4 and IPv6. UDP has no
 /// remote endpoint in the owning-PID tables, so it is left blank.
 pub fn list_network_connections() -> SystemResult<Vec<NetworkConnection>> {
+    connections(None)
+}
+
+fn connections(mut meter: Option<&mut TrafficMeter>) -> SystemResult<Vec<NetworkConnection>> {
     let mut output = Vec::new();
     unsafe {
         for family in [AF_INET as u32, AF_INET6 as u32] {
@@ -910,22 +1193,30 @@ pub fn list_network_connections() -> SystemResult<Vec<NetworkConnection>> {
                         let row = match (tcp, ipv4_family) {
                             (true, true) => {
                                 let r = std::ptr::read_unaligned(ptr as *const MIB_TCPROW_OWNER_PID);
+                                let local_address = ipv4(r.dwLocalAddr, r.dwLocalPort);
+                                let remote_address = ipv4(r.dwRemoteAddr, r.dwRemotePort);
+                                let traffic = meter.as_deref_mut().and_then(|m| m.sample_v4(&r, &local_address, &remote_address));
                                 NetworkConnection {
                                     protocol: "TCP4".into(),
-                                    local_address: ipv4(r.dwLocalAddr, r.dwLocalPort),
-                                    remote_address: ipv4(r.dwRemoteAddr, r.dwRemotePort),
+                                    local_address,
+                                    remote_address,
                                     state: tcp_state(r.dwState).into(),
                                     pid: r.dwOwningPid,
+                                    traffic,
                                 }
                             }
                             (true, false) => {
                                 let r = std::ptr::read_unaligned(ptr as *const MIB_TCP6ROW_OWNER_PID);
+                                let local_address = ipv6(r.ucLocalAddr, r.dwLocalScopeId, r.dwLocalPort);
+                                let remote_address = ipv6(r.ucRemoteAddr, r.dwRemoteScopeId, r.dwRemotePort);
+                                let traffic = meter.as_deref_mut().and_then(|m| m.sample_v6(&r, &local_address, &remote_address));
                                 NetworkConnection {
                                     protocol: "TCP6".into(),
-                                    local_address: ipv6(r.ucLocalAddr, r.dwLocalScopeId, r.dwLocalPort),
-                                    remote_address: ipv6(r.ucRemoteAddr, r.dwRemoteScopeId, r.dwRemotePort),
+                                    local_address,
+                                    remote_address,
                                     state: tcp_state(r.dwState).into(),
                                     pid: r.dwOwningPid,
+                                    traffic,
                                 }
                             }
                             (false, true) => {
@@ -936,6 +1227,7 @@ pub fn list_network_connections() -> SystemResult<Vec<NetworkConnection>> {
                                     remote_address: String::new(),
                                     state: "Bound".into(),
                                     pid: r.dwOwningPid,
+                                    traffic: None,
                                 }
                             }
                             (false, false) => {
@@ -946,6 +1238,7 @@ pub fn list_network_connections() -> SystemResult<Vec<NetworkConnection>> {
                                     remote_address: String::new(),
                                     state: "Bound".into(),
                                     pid: r.dwOwningPid,
+                                    traffic: None,
                                 }
                             }
                         };
@@ -1166,5 +1459,74 @@ mod tests {
         let unique: std::collections::HashSet<_> = autoruns.iter().map(|a| (&a.location, &a.name, &a.command)).collect();
         assert_eq!(unique.len(), autoruns.len(), "no startup entry is listed twice");
         list_network_connections().unwrap();
+    }
+
+    #[test]
+    fn drivers_without_a_registered_path_use_the_default_location() {
+        assert_eq!(effective_binary_path(String::new(), "Beep", 1), r"\SystemRoot\System32\drivers\Beep.sys");
+        assert_eq!(effective_binary_path(String::new(), "Ntfs", 2), r"\SystemRoot\System32\drivers\Ntfs.sys");
+        assert_eq!(effective_binary_path(r"system32\drivers\a.sys".into(), "a", 1), r"system32\drivers\a.sys");
+        assert_eq!(effective_binary_path(String::new(), "svc", 0x10), "", "only drivers have that default");
+    }
+
+    #[test]
+    fn every_running_driver_resolves_to_a_file_path() {
+        let unresolved: Vec<String> = list_services(true)
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.state == "Running" && crate::inventory::image_path_from_command(&d.binary_path).is_none())
+            .map(|d| d.name)
+            .collect();
+        assert!(unresolved.is_empty(), "{unresolved:?}");
+    }
+
+    #[test]
+    fn flow_rates_use_the_elapsed_window() {
+        let start = Instant::now();
+        let mut flow = Flow { down: 1000, up: 500, at: start, down_rate: 0.0, up_rate: 0.0, generation: 0 };
+        let one_second = start + std::time::Duration::from_secs(1);
+        let t = flow.advance(3000, 600, one_second, 1);
+        assert_eq!((t.down_per_sec, t.up_per_sec, t.total_down, t.total_up), (2000.0, 100.0, 3000, 600));
+        // Too soon to measure: totals move, the rate holds.
+        let t = flow.advance(9000, 600, one_second + std::time::Duration::from_millis(10), 2);
+        assert_eq!((t.down_per_sec, t.total_down), (2000.0, 9000));
+        // A counter that goes backwards never yields a huge rate.
+        let t = flow.advance(10, 10, one_second + std::time::Duration::from_secs(1), 3);
+        assert_eq!((t.down_per_sec, t.up_per_sec), (0.0, 0.0));
+    }
+
+    #[test]
+    fn meter_measures_real_loopback_traffic() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        if !is_elevated() {
+            eprintln!("skipped: per-connection counters need elevation");
+            return;
+        }
+        const BYTES: usize = 2 * 1024 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let (client_local, client_remote) = (client.local_addr().unwrap().to_string(), client.peer_addr().unwrap().to_string());
+        let find = |list: &[NetworkConnection], local: &str, remote: &str| {
+            list.iter().find(|c| c.local_address == local && c.remote_address == remote).and_then(|c| c.traffic)
+        };
+
+        let mut meter = TrafficMeter::new();
+        let before = meter.list().unwrap();
+        assert!(find(&before, &client_local, &client_remote).is_some(), "the counters switch on");
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let sender = std::thread::spawn(move || client.write_all(&vec![7u8; BYTES]).map(|()| client));
+        let mut received = vec![0u8; BYTES];
+        server.read_exact(&mut received).unwrap();
+        let _client = sender.join().unwrap().unwrap();
+
+        let after = meter.list().unwrap();
+        let sent = find(&after, &client_local, &client_remote).expect("client row");
+        let got = find(&after, &client_remote, &client_local).expect("server row");
+        assert!(sent.total_up >= BYTES as u64, "{sent:?}");
+        assert!(got.total_down >= BYTES as u64, "{got:?}");
+        assert!(sent.up_per_sec > 0.0 && got.down_per_sec > 0.0, "{sent:?} {got:?}");
     }
 }

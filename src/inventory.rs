@@ -2,8 +2,8 @@
 //! calls) plus command-line and shortcut resolution.
 
 pub use crate::system::{
-    AutorunInfo, FileDetails, ModuleInfo, Monitor, NetworkConnection, ProcessIdentity, ProcessInfo, ProcessSnapshot,
-    ServiceInfo,
+    AutorunInfo, ConnectionTraffic, FileDetails, ModuleInfo, Monitor, NetworkConnection, ProcessIdentity, ProcessInfo,
+    ProcessSnapshot, ServiceInfo, TrafficMeter,
 };
 use crate::system as backend;
 
@@ -19,6 +19,15 @@ pub struct SystemInventory {
 }
 
 pub fn collect() -> SystemInventory {
+    gather(backend::list_network_connections())
+}
+
+/// Like [`collect`], with traffic figures on the connections.
+pub fn collect_metered(meter: &mut TrafficMeter) -> SystemInventory {
+    gather(meter.list())
+}
+
+fn gather(connections: Result<Vec<NetworkConnection>, String>) -> SystemInventory {
     let mut inv = SystemInventory { collected_unix: crate::winutil::now_unix(), ..Default::default() };
     match backend::list_services(false) {
         Ok(v) => inv.services = v,
@@ -32,7 +41,7 @@ pub fn collect() -> SystemInventory {
         Ok(v) => inv.startup = v,
         Err(e) => inv.errors.push(format!("Startup: {e}")),
     }
-    match backend::list_network_connections() {
+    match connections {
         Ok(v) => inv.connections = v,
         Err(e) => inv.errors.push(format!("Connections: {e}")),
     }

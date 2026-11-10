@@ -6,7 +6,9 @@ use ntsentry::integrity_monitor::{capture_baseline, load_baseline, ntdll_path, s
 use ntsentry::integrity_monitor::{SWEEP_MODULE, sweep_processes};
 use ntsentry::process_inventory::{KnownDirs, ProcessInventory};
 use ntsentry::signature::{SignatureCache, SignatureState, signature_info};
-use ntsentry::{file_icon, inventory, module_audit, persistence_audit};
+use ntsentry::{file_icon, inventory, module_audit, persistence_audit, quarantine, service_control};
+use ntsentry::inventory::ServiceInfo;
+use ntsentry::service_control::ServiceOp;
 use ntsentry::storage::DataDir;
 
 struct Scratch(std::path::PathBuf);
@@ -22,6 +24,87 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A throwaway service that is never started, removed when dropped.
+struct TestService(String);
+
+impl TestService {
+    fn create(tag: &str, binary: &str) -> Self {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("NtSentryTest{tag}{}{nanos}", std::process::id());
+        let status = std::process::Command::new("sc.exe")
+            .args(["create", &name, "binPath=", binary, "start=", "demand"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "sc create failed");
+        TestService(name)
+    }
+
+    fn info(&self) -> ServiceInfo {
+        ntsentry::system::list_services(false).unwrap().into_iter().find(|s| s.name == self.0).expect("test service listed")
+    }
+}
+
+impl Drop for TestService {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("sc.exe").args(["delete", &self.0]).stdout(std::process::Stdio::null()).status();
+    }
+}
+
+#[test]
+fn service_start_changes_and_quarantine_work_on_a_real_service() {
+    if !ntsentry::system::is_elevated() {
+        eprintln!("skipped: changing services needs elevation");
+        return;
+    }
+    let scratch = Scratch::new("service");
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let data = DataDir::at(scratch.0.join("data"));
+    let file = scratch.0.join("payload.exe");
+    std::fs::write(&file, b"MZ harmless test payload").unwrap();
+    let service = TestService::create("Q", &file.to_string_lossy());
+
+    assert_eq!(service.info().start_type, "Manual");
+    for (op, expected) in [(ServiceOp::Disable, "Disabled"), (ServiceOp::EnableAutomatic, "Automatic"), (ServiceOp::EnableManual, "Manual")] {
+        service_control::apply(&data, &service.info(), op).unwrap();
+        assert_eq!(service.info().start_type, expected);
+    }
+    service_control::apply(&data, &service.info(), ServiceOp::Stop).expect("stopping a stopped service is fine");
+
+    let mut stale = service.info();
+    stale.binary_path = r"C:\somewhere\else.exe".into();
+    assert!(service_control::apply(&data, &stale, ServiceOp::Disable).unwrap_err().contains("changed"));
+    assert_eq!(service.info().start_type, "Manual", "a stale target changes nothing");
+
+    let message = service_control::apply(&data, &service.info(), ServiceOp::Quarantine).unwrap();
+    assert!(message.contains("quarantined"), "{message}");
+    assert!(!file.exists(), "the file moved out");
+    assert_eq!(service.info().start_type, "Disabled");
+    let entries = quarantine::list(&data);
+    assert_eq!(entries.len(), 1);
+    quarantine::restore(&data, &entries[0].id).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"MZ harmless test payload");
+}
+
+#[test]
+fn microsofts_own_files_are_never_quarantined() {
+    if !ntsentry::system::is_elevated() {
+        eprintln!("skipped: changing services needs elevation");
+        return;
+    }
+    let scratch = Scratch::new("servicems");
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let data = DataDir::at(scratch.0.join("data"));
+    let cmd = format!(r"{}\System32\cmd.exe", ntsentry::winutil::windows_directory().unwrap());
+    let service = TestService::create("M", &cmd);
+
+    let error = service_control::apply(&data, &service.info(), ServiceOp::Quarantine).unwrap_err();
+    assert!(error.contains("Microsoft"), "{error}");
+    assert!(std::path::Path::new(&cmd).exists());
+    assert_eq!(service.info().start_type, "Manual", "refused before anything changed");
+    assert!(quarantine::list(&data).is_empty());
 }
 
 #[test]

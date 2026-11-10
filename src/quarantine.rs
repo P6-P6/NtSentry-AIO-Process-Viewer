@@ -46,11 +46,13 @@ pub fn refusal(path: &str, windows_dir: &str) -> Option<String> {
     if lower.starts_with(&windows) {
         return Some(format!("{path} is under the Windows folder; quarantining Windows files can break the system"));
     }
+    own_file_refusal(path)
+}
+
+/// Refuses this program's own file.
+pub fn own_file_refusal(path: &str) -> Option<String> {
     let own = std::env::current_exe().ok().map(|p| p.to_string_lossy().to_lowercase());
-    if own.as_deref() == Some(lower.as_str()) {
-        return Some("The dashboard does not quarantine itself".into());
-    }
-    None
+    (own.as_deref() == Some(path.to_lowercase().as_str())).then(|| "The dashboard does not quarantine itself".to_string())
 }
 
 /// Copies `path` into quarantine, verifies the copy, then deletes the original.
@@ -60,6 +62,19 @@ pub fn quarantine_file(data: &DataDir, path: &str, process: &str, signature: &st
     if let Some(reason) = refusal(path, &windows) {
         return Err(reason);
     }
+    move_into_quarantine(data, path, process, signature)
+}
+
+/// For a stopped service or driver. Third-party drivers normally live under the
+/// Windows folder, so the caller refuses Microsoft's own files by signature instead.
+pub fn quarantine_service_file(data: &DataDir, path: &str, owner: &str, signature: &str) -> Result<QuarantineEntry, String> {
+    if let Some(reason) = own_file_refusal(path) {
+        return Err(reason);
+    }
+    move_into_quarantine(data, path, owner, signature)
+}
+
+fn move_into_quarantine(data: &DataDir, path: &str, process: &str, signature: &str) -> Result<QuarantineEntry, String> {
     let bytes = fs::read(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
     let sha256 = sha256_hex(&bytes);
     let root = quarantine_dir(data);

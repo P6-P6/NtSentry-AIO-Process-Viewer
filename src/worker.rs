@@ -10,7 +10,11 @@
 use crate::file_icon::{IconImage, small_icon};
 use crate::findings::{Finding, ScanReport, Severity};
 use crate::integrity_monitor::{self, CaptureOutcome, IntegrityReport};
-use crate::inventory::{self, AutorunInfo, Monitor, ProcessDetails, ProcessIdentity, ProcessSnapshot, SystemInventory};
+use crate::inventory::{
+    self, AutorunInfo, Monitor, NetworkConnection, ProcessDetails, ProcessIdentity, ProcessSnapshot, ServiceInfo, SystemInventory,
+    TrafficMeter,
+};
+use crate::service_control::{self, ServiceOp};
 use crate::process_inventory::{self, KnownDirs, ProcessInventory, ProcessReport};
 use crate::signature::SignatureCache;
 use crate::{module_audit, persistence_audit};
@@ -36,6 +40,7 @@ pub enum Command {
 #[derive(Clone, Debug)]
 pub enum LiveCommand {
     RefreshProcesses,
+    RefreshConnections,
     CollectInventory,
     ProcessDetails { identity: ProcessIdentity, path: String },
     Act(Action),
@@ -52,6 +57,8 @@ pub enum Action {
     Restore { id: String },
     /// Turn a startup entry off or on for future sign-ins.
     SetStartup { entry: AutorunInfo, disable: bool },
+    /// Stop, disable, enable or quarantine a service or driver.
+    Service { target: ServiceInfo, op: ServiceOp },
 }
 
 #[derive(Debug)]
@@ -69,6 +76,8 @@ pub enum Event {
     Finished,
     Live(Result<ProcessSnapshot, String>),
     Inventory(SystemInventory),
+    /// The connection list alone, refreshed often for its traffic figures.
+    Connections(Result<Vec<NetworkConnection>, String>),
     ProcessDetails(ProcessDetails),
     /// Loaded icons, as (command they were requested for, icon).
     Icons(Vec<(String, Option<IconImage>)>),
@@ -272,6 +281,14 @@ fn perform(data: &DataDir, action: Action) -> (bool, String, String) {
                 Err(e) => (false, format!("Could not {verb} {}: {e}", entry.name), who),
             }
         }
+        Action::Service { target, op } => {
+            let kind = if target.is_driver() { persistence_audit::EntryKind::Driver } else { persistence_audit::EntryKind::Service };
+            let who = persistence_audit::subject(kind, &target.name, "");
+            match service_control::apply(data, &target, op) {
+                Ok(message) => (true, message, who),
+                Err(e) => (false, format!("{}: {e}", target.name), who),
+            }
+        }
     }
 }
 
@@ -279,10 +296,12 @@ fn run_live(data: DataDir, inbox: Receiver<LiveCommand>, outbox: Sender<Event>, 
     let mut monitor = Monitor::new();
     // The first sample only establishes CPU baselines.
     let _ = monitor.refresh();
+    let mut traffic = TrafficMeter::new();
     while let Ok(command) = inbox.recv() {
         let event = match command {
             LiveCommand::RefreshProcesses => Event::Live(monitor.refresh()),
-            LiveCommand::CollectInventory => Event::Inventory(inventory::collect()),
+            LiveCommand::RefreshConnections => Event::Connections(traffic.list()),
+            LiveCommand::CollectInventory => Event::Inventory(inventory::collect_metered(&mut traffic)),
             LiveCommand::ProcessDetails { identity, path } => {
                 Event::ProcessDetails(inventory::process_details(identity, &path))
             }

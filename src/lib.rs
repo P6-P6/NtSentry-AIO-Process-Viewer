@@ -25,6 +25,7 @@ pub mod pe;
 pub mod persistence_audit;
 pub mod process_inventory;
 pub mod quarantine;
+pub mod service_control;
 pub mod settings;
 pub mod signature;
 pub mod startup_control;
